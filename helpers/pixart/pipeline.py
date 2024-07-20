@@ -760,6 +760,17 @@ class PixArtSigmaPipeline(DiffusionPipeline):
                 # get latents
                 latents = self.scheduler.add_noise(latents, noise, timestep)
 
+        latents_mean = latents_std = None
+        if (
+            hasattr(self.vae.config, "latents_mean")
+            and self.vae.config.latents_mean is not None
+        ):
+            latents_mean = torch.tensor(self.vae.config.latents_mean).view(1, 4, 1, 1)
+        if (
+            hasattr(self.vae.config, "latents_std")
+            and self.vae.config.latents_std is not None
+        ):
+            latents_std = torch.tensor(self.vae.config.latents_std).view(1, 4, 1, 1)
         # scale the initial noise by the standard deviation required by the scheduler
         init_latents = latents * self.scheduler.init_noise_sigma
 
@@ -814,7 +825,7 @@ class PixArtSigmaPipeline(DiffusionPipeline):
                 # expand init_latents for batch_size
                 additional_image_per_prompt = batch_size // init_latents.shape[0]
                 init_latents = torch.cat(
-                    [init_latents] * additional_image_per_ompt, dim=0
+                    [init_latents] * additional_image_per_prompt, dim=0
                 )
             elif (
                 batch_size > init_latents.shape[0]
@@ -1062,7 +1073,7 @@ class PixArtSigmaPipeline(DiffusionPipeline):
         # 5. Prepare latents.
         if image is not None:
             image = self.image_processor.preprocess(image)
-            image = image.to(device=device, dtype=dtype)
+            image = image.to(device=self.vae.device, dtype=self.vae.dtype)
 
         latent_channels = self.transformer.config.in_channels
         latent_timestep = None
