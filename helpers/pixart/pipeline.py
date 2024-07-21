@@ -246,12 +246,17 @@ class PixArtSigmaPipeline(DiffusionPipeline):
         self, num_inference_steps, strength, device, denoising_start=None
     ):
         # get the original timestep using init_timestep
-        if denoising_start is not None:
+        if denoising_start is None and strength is not None:
             init_timestep = min(
-                int(num_inference_steps * denoising_start), num_inference_steps
+                int(num_inference_steps * strength), num_inference_steps
             )
+            print(f"Init timestep: {init_timestep}")
             t_start = max(num_inference_steps - init_timestep, 0)
+            print(
+                f"t_start = max({num_inference_steps} - {init_timestep}, 0) = {t_start}"
+            )
         else:
+            print(f"denoising_start: {denoising_start}")
             t_start = 0
 
         timesteps = self.scheduler.timesteps[t_start * self.scheduler.order :]
@@ -729,7 +734,7 @@ class PixArtSigmaPipeline(DiffusionPipeline):
         dtype,
         device,
         generator,
-        latents=None,
+        _latents=None,
         timestep=None,
         add_noise=False,
         image=None,
@@ -746,19 +751,13 @@ class PixArtSigmaPipeline(DiffusionPipeline):
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
-        if latents is None:
-            latents = randn_tensor(
+        if _latents is not None:
+            init_latents = _latents.to(device)
+        elif image is None and _latents is None:
+            print("Make random latents tensor")
+            init_latents = randn_tensor(
                 shape, generator=generator, device=device, dtype=dtype
             )
-        else:
-            latents = latents.to(device)
-            if add_noise and timestep is not None:
-                shape = latents.shape
-                noise = randn_tensor(
-                    shape, generator=generator, device=device, dtype=dtype
-                )
-                # get latents
-                latents = self.scheduler.add_noise(latents, noise, timestep)
 
         latents_mean = latents_std = None
         if (
@@ -771,52 +770,59 @@ class PixArtSigmaPipeline(DiffusionPipeline):
             and self.vae.config.latents_std is not None
         ):
             latents_std = torch.tensor(self.vae.config.latents_std).view(1, 4, 1, 1)
-        # scale the initial noise by the standard deviation required by the scheduler
-        init_latents = latents * self.scheduler.init_noise_sigma
+        if image is not None and hasattr(image, "shape") and image.shape[1] == 4:
+            print("Received valid latent image input.")
+            init_latents = image
 
-        if image is not None:
-            if image.shape[1] == 4:
-                init_latents = image
+        if init_latents is not None:
+            # scale the initial noise by the standard deviation required by the scheduler
+            print(f"Scaling the initial noise by the std required by the scheduler.")
+            init_latents = init_latents * self.scheduler.init_noise_sigma
 
+        if image is not None and image.shape[1] < 4:
+            print("Received RGB or similar image. Processing..")
+            # make sure the VAE is in float32 mode, as it overflows in float16
+            if self.vae.config.force_upcast:
+                image = image.float()
+                self.vae.to(dtype=torch.float32)
+
+            if isinstance(generator, list) and len(generator) != batch_size:
+                raise ValueError(
+                    f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                    f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+                )
+
+            elif isinstance(generator, list):
+                init_latents = [
+                    retrieve_latents(
+                        self.vae.encode(image[i : i + 1]), generator=generator[i]
+                    )
+                    for i in range(batch_size)
+                ]
+                init_latents = torch.cat(init_latents, dim=0)
             else:
-                # make sure the VAE is in float32 mode, as it overflows in float16
-                if self.vae.config.force_upcast:
-                    image = image.float()
-                    self.vae.to(dtype=torch.float32)
+                print("Encode image to latents.")
+                init_latents = retrieve_latents(
+                    self.vae.encode(image), generator=generator
+                )
 
-                if isinstance(generator, list) and len(generator) != batch_size:
-                    raise ValueError(
-                        f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-                        f" size of {batch_size}. Make sure the batch size matches the length of the generators."
-                    )
+            if self.vae.config.force_upcast:
+                self.vae.to(dtype)
 
-                elif isinstance(generator, list):
-                    init_latents = [
-                        retrieve_latents(
-                            self.vae.encode(image[i : i + 1]), generator=generator[i]
-                        )
-                        for i in range(batch_size)
-                    ]
-                    init_latents = torch.cat(init_latents, dim=0)
-                else:
-                    init_latents = retrieve_latents(
-                        self.vae.encode(image), generator=generator
-                    )
-
-                if self.vae.config.force_upcast:
-                    self.vae.to(dtype)
-
-                init_latents = init_latents.to(dtype)
-                if latents_mean is not None and latents_std is not None:
-                    latents_mean = latents_mean.to(device=device, dtype=dtype)
-                    latents_std = latents_std.to(device=device, dtype=dtype)
-                    init_latents = (
-                        (init_latents - latents_mean)
-                        * self.vae.config.scaling_factor
-                        / latents_std
-                    )
-                else:
-                    init_latents = self.vae.config.scaling_factor * init_latents
+            print("Set initial latents..")
+            init_latents = init_latents.to(dtype)
+            if latents_mean is not None and latents_std is not None:
+                print("Scaling latents by mean/std")
+                latents_mean = latents_mean.to(device=device, dtype=dtype)
+                latents_std = latents_std.to(device=device, dtype=dtype)
+                init_latents = (
+                    (init_latents - latents_mean)
+                    * self.vae.config.scaling_factor
+                    / latents_std
+                )
+            else:
+                print("Scaling latents only by scaling_factor")
+                init_latents = self.vae.config.scaling_factor * init_latents
 
             if (
                 batch_size > init_latents.shape[0]
@@ -836,6 +842,17 @@ class PixArtSigmaPipeline(DiffusionPipeline):
                 )
             else:
                 init_latents = torch.cat([init_latents], dim=0)
+
+        if (
+            add_noise
+            and timestep is not None
+            and (_latents is not None or image is not None)
+        ):
+            shape = init_latents.shape
+            noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            # get latents
+            print(f"Adding noise to tensor for timestep: {timestep}")
+            init_latents = self.scheduler.add_noise(init_latents, noise, timestep)
 
         return init_latents
 
@@ -1077,7 +1094,11 @@ class PixArtSigmaPipeline(DiffusionPipeline):
 
         latent_channels = self.transformer.config.in_channels
         latent_timestep = None
-        if denoising_end is not None or denoising_start is not None:
+        if (
+            denoising_end is not None
+            or denoising_start is not None
+            or strength is not None
+        ):
             timesteps, num_inference_steps = self.get_timesteps(
                 num_inference_steps,
                 strength,
@@ -1093,8 +1114,17 @@ class PixArtSigmaPipeline(DiffusionPipeline):
                 height, width = latents.shape[-2:]
                 height = height * self.vae_scale_factor
                 width = width * self.vae_scale_factor
-        add_noise = True if self.denoising_start is None else False
+        add_noise = (
+            True
+            if (
+                self.denoising_start is None
+                and (image is not None or latents is not None)
+            )
+            else False
+        )
+        print(f"Add_noise: {add_noise}")
         if latents is None:
+            print("Prepare latents..")
             latents = self.prepare_latents(
                 batch_size * num_images_per_prompt,
                 latent_channels,
