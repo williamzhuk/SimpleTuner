@@ -1,10 +1,8 @@
-## AuraFlow v0.1
+## Kwai Kolors Quickstart
 
-In this example, we'll be training a **LoRA** on an AuraFlow model using the SimpleTuner toolkit.
+In this example, we'll be training a Kwai Kolors model using the SimpleTuner toolkit and will be using the `lora` model type.
 
-> ⛔️ Full fine-tuning requires the use of FSDP due to a lack of optimisations in the currently available MMDiT transformer module for AuraFlow. Experimentation with [DeepSpeed](/documentation/DEEPSPEED.md) is required for full network training.
-
-> ⚠️ LoRA is not currently supported for AuraFlow when using upstream Diffusers. A [special version](#diffusers) is required for full feature support.
+Kolors is roughly the same size as SDXL, so you can try `full` training, but the changes for that are not described in this quickstart guide.
 
 ### Prerequisites
 
@@ -43,20 +41,6 @@ poetry install --no-root
 poetry install --no-root -C install/rocm
 ```
 
-#### Diffusers
-
-Additionally, because of AuraFlow's preliminary support in the Diffusers project, you will have to manually install a fork that contains the AuraFlow patches already-integrated.
-
-This command should be executed while you are still inside your venv from earlier:
-
-```bash
-pip install git+https://github.com/bghira/diffusers@feature/lavender-flow-complete
-```
-
-For your own security, you may audit the changes between this branch and upstream Diffusers repository [here](https://github.com/bghira/diffusers/tree/feature/lavender-flow-complete).
-
-This page will be updated after full support lands in the Diffusers project, negating the requirement for this part to be done manually. That progress can be viewed [here](https://github.com/huggingface/diffusers/pull/8796). If that issue has been closed and this page has not yet been updated, please take the time to open an issue report on GitHub [here](https://github.com/bghira/SimpleTuner/isssues).
-
 ### Setting up the environment
 
 To run SimpleTuner, you will need to set up a configuration file, the dataset and model directories, and a dataloader configuration file.
@@ -71,12 +55,16 @@ cp config/config.env.example config/config.env
 
 There, you will need to modify the following variables:
 
-- `MODEL_TYPE` - This should remain set as `lora`. **`full` will not work.**
-- `AURA_FLOW` - Set this to `true`.
-- `MODEL_NAME` - Set this to `fal/AuraFlow`.
+- `MODEL_TYPE` - Set this to `lora`.
+- `USE_DORA` - Set this to `true` if you wish to train DoRA.
+- `KOLORS` - Set this to `true`.
+- `MODEL_NAME` - Set this to `Kwai-Kolors/Kolors-diffusers`.
 - `BASE_DIR` - Set this to the directory where you want to store your outputs and datasets. It's recommended to use a full path here.
-- `VALIDATION_RESOLUTION` - As AuraFlow v0.1a is a 512px model, you should set this to `512x512`.
-- `VALIDATION_GUIDANCE` - Aura benefits from a very-low value. Set this to `3.0`.
+- `VALIDATION_RESOLUTION` - Set this to `1024x1024` for this example.
+  - Additionally, Kolors was fine-tuned on multi-aspect buckets, and other resolutions may be specified using commas to separate them: `1024x1024,1280x768`
+- `VALIDATION_GUIDANCE` - Use whatever value you are comfortable with for testing at inference time. Set this between `4.2` to `6.4`.
+- `USE_GRADIENT_CHECKPOINTING` - This should probably be `true` unless you have a LOT of VRAM and want to sacrifice some to make it go faster.
+- `LEARNING_RATE` - `1e-4` is fairly common for low-rank networks, though `1e-5` might be a more conservative choice if you notice any "burning" or early overtraining.
 
 There are a few more if using a Mac M-series machine:
 
@@ -85,7 +73,7 @@ There are a few more if using a Mac M-series machine:
 
 #### Dataset considerations
 
-It's crucial to have a substantial dataset to train your model on. There are limitations on the dataset size, and you will need to ensure that your dataset is large enough to train your model effectively. Note that the bare minimum dataset size is `TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS`. The dataset will not be useable if it is too small.
+It's crucial to have a substantial dataset to train your model on. There are limitations on the dataset size, and you will need to ensure that your dataset is large enough to train your model effectively. Note that the bare minimum dataset size is `TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS`. The dataset will not be discoverable by the trainer if it is too small.
 
 Depending on the dataset you have, you will need to set up your dataset directory and dataloader configuration file differently. In this example, we will be using [pseudo-camera-10k](https://huggingface.co/datasets/ptx0/pseudo-camera-10k) as the dataset.
 
@@ -94,17 +82,17 @@ In your `BASE_DIR` directory, create a multidatabackend.json:
 ```json
 [
   {
-    "id": "pseudo-camera-10k-aura",
+    "id": "pseudo-camera-10k-kolors",
     "type": "local",
     "crop": true,
     "crop_aspect": "square",
-    "crop_style": "center",
-    "resolution": 0.5,
+    "crop_style": "random",
+    "resolution": 1.0,
     "minimum_image_size": 0.25,
     "maximum_image_size": 1.0,
     "target_downsample_size": 1.0,
     "resolution_type": "area",
-    "cache_dir_vae": "cache/vae/aura/pseudo-camera-10k",
+    "cache_dir_vae": "cache/vae/kolors/pseudo-camera-10k",
     "instance_data_dir": "datasets/pseudo-camera-10k",
     "disabled": false,
     "skip_file_discovery": "",
@@ -116,23 +104,18 @@ In your `BASE_DIR` directory, create a multidatabackend.json:
     "type": "local",
     "dataset_type": "text_embeds",
     "default": true,
-    "cache_dir": "cache/text/aura/pseudo-camera-10k",
+    "cache_dir": "cache/text/kolors/pseudo-camera-10k",
     "disabled": false,
     "write_batch_size": 128
   }
 ]
 ```
 
-> ⛔️ Resolutions other than `resolution=512, resolution_type=pixel` or `resolution=0.5, resolution_type=area` are not supported by AuraFlow and will result in errors.
-
 Then, navigate to the `BASE_DIR` directory and create a `datasets` directory:
 
 ```bash
-apt -y install git-lfs
 mkdir -p datasets
-pushd datasets
-    git clone https://huggingface.co/datasets/ptx0/pseudo-camera-10k
-popd
+huggingface-cli download --repo-type=dataset ptx0/pseudo-camera-10k --local-dir=datasets/pseudo-camera-10k
 ```
 
 This will download about 10k photograph samples to your `datasets/pseudo-camera-10k` directory, which will be automatically created for you.

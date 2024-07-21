@@ -91,15 +91,32 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--kolors",
+        action="store_true",
+        default=False,
+        help=("This option must be provided when training a Kolors model."),
+    )
+    parser.add_argument(
         "--aura_flow",
         action="store_true",
         default=False,
         help=("This must be set when training an AuraFlow model."),
     )
     parser.add_argument(
+        "--flow_matching_loss",
+        type=str,
+        choices=["diffusers", "compatible", "diffusion"],
+        default="diffusers",
+        help=(
+            "A discrepancy exists between the Diffusers implementation of flow matching and the minimal implementations provided"
+            " by StabilityAI and AuraFlow. This experimental option allows switching loss calculations to be compatible with those."
+            " Additionally, 'diffusion' is offered as an option to reparameterise a model to v_prediction loss."
+        ),
+    )
+    parser.add_argument(
         "--aura_flow_target",
         type=str,
-        choices=["all", "dit", "mmdit"],
+        choices=["any", "dit", "mmdit"],
         default="dit",
         help=(
             "Aura Diffusion contains joint attention MM-DiT blocks as well as standard DiT. When training a LoRA, we can limit the blocks trained."
@@ -109,11 +126,21 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--aura_flow_freeze_direction",
+        type=str,
+        choices=["up", "down"],
+        default="up",
+        help=(
+            "When freezing the AuraFlow model, you can freeze it 'up' from the bottom, or 'down' from the top."
+            " The default value is 'up' which will freeze the model from layer 11 to 31 by default."
+        ),
+    )
+    parser.add_argument(
         "--aura_flow_first_unfrozen_dit_layer",
         type=int,
-        default=20,
+        default=11,
         help=(
-            "Due to the size of the Aura Flow model, by default only the 20th layer and up will be trained."
+            "Due to the size of the AuraFlow model, by default only the 20th layer and up will be trained."
             " More layers can be excluded to speed up training or reduce VRAM consumption further."
         ),
     )
@@ -122,7 +149,7 @@ def parse_args(input_args=None):
         type=int,
         default=0,
         help=(
-            "By default, Aura Flow's MM-DiT blocks are not trained as they are very large and training them is unnecessary for finetuning."
+            "By default, AuraFlow's MM-DiT blocks are not trained as they are very large and training them is unnecessary for finetuning."
         ),
     )
     parser.add_argument(
@@ -144,25 +171,33 @@ def parse_args(input_args=None):
         help=("This option must be provided when training a Stable Diffusion 3 model."),
     )
     parser.add_argument(
-        "--sd3_uses_diffusion",
-        action="store_true",
-        default=False,
+        "--sd3_t5_mask_behaviour",
+        type=str,
+        choices=["do-nothing", "mask"],
+        default="mask",
         help=(
-            "The rectified flow objective of stable diffusion 3 seems to hold few advantages, yet is very difficult to train with."
-            " If this option is supplied, a normal DDPM-based diffusion schedule will be used to train, instead of flow-matching."
-            " This will take a lot of data and even more compute to resolve. If possible, use a pretrained SD3 Diffusion model."
+            "StabilityAI did not correctly implement their attention masking on T5 inputs for SD3 Medium."
+            " This option enables you to switch between their broken implementation or the corrected mask"
+            " implementation. Although, the corrected masking is still applied via hackish workaround,"
+            " manually applying the mask to the prompt embeds so that the padded positions are zero."
+            " This improves the results for short captions, but does not change the behaviour for long captions."
+            " It is important to note that this limitation currently prevents expansion of SD3 Medium's"
+            " prompt length, as it will unnecessarily attend to every token in the prompt embed,"
+            " even masked positions."
         ),
     )
     parser.add_argument(
         "--weighting_scheme",
         type=str,
-        default="logit_normal",
-        choices=["sigma_sqrt", "logit_normal", "mode"],
+        default="none",
+        choices=["sigma_sqrt", "logit_normal", "mode", "none"],
         help=(
             "Stable Diffusion 3 used either uniform sampling of timesteps with post-prediction loss weighting, or"
             " a weighted timestep selection by mode or log-normal distribution. The default for SD3 is logit_normal, though"
             " upstream Diffusers training examples use sigma_sqrt. The mode option is experimental,"
-            " as it is the most difficult to implement cleanly. In short experiments, logit_normal produced the best results."
+            " as it is the most difficult to implement cleanly. In experiments, logit_normal produced the best results"
+            " for large-scale finetuning across many nodes. For small scale tuning, 'none' returns the best results."
+            " The default is 'none'."
         ),
     )
     parser.add_argument(
@@ -1788,7 +1823,7 @@ def parse_args(input_args=None):
             )
             args.disable_compel = True
 
-    t5_max_length = 512
+    t5_max_length = 120
     if args.aura_flow and (
         args.tokenizer_max_length is None
         or int(args.tokenizer_max_length) > t5_max_length
@@ -1801,6 +1836,23 @@ def parse_args(input_args=None):
         else:
             warning_log(
                 f"-!- T5 supports a max length of {t5_max_length} tokens, but you have supplied `--i_know_what_i_am_doing`, so this limit will not be enforced. -!-"
+            )
+            warning_log(
+                f"Your outputs will possibly look incoherent if the model you are continuing from has not been tuned beyond {t5_max_length} tokens."
+            )
+    t5_max_length = 77
+    if args.sd3 and (
+        args.tokenizer_max_length is None
+        or int(args.tokenizer_max_length) > t5_max_length
+    ):
+        if not args.i_know_what_i_am_doing:
+            warning_log(
+                f"Updating T5 XXL tokeniser max length to {t5_max_length} for SD3."
+            )
+            args.tokenizer_max_length = t5_max_length
+        else:
+            warning_log(
+                f"-!- SD3 supports a max length of {t5_max_length} tokens, but you have supplied `--i_know_what_i_am_doing`, so this limit will not be enforced. -!-"
             )
             warning_log(
                 f"Your outputs will possibly look incoherent if the model you are continuing from has not been tuned beyond {t5_max_length} tokens."

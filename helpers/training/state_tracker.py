@@ -21,6 +21,7 @@ class StateTracker:
     global_step = 0
     global_resume_step = None
     epoch_step = 0
+    epoch_micro_step = 0
     epoch = 1
 
     ## Caches
@@ -101,6 +102,7 @@ class StateTracker:
             "sd3",
             "pixart_sigma",
             "aura_flow",
+            "kolors",
         ]:
             raise ValueError(f"Unknown model type: {model_type}")
         cls.model_type = model_type

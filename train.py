@@ -132,6 +132,10 @@ def import_model_class_from_model_name_or_path(
         from transformers import UMT5EncoderModel
 
         return UMT5EncoderModel
+    elif model_class == "ChatGLMModel":
+        from diffusers import ChatGLMModel
+
+        return ChatGLMModel
     else:
         raise ValueError(f"{model_class} is not supported.")
 
@@ -144,18 +148,31 @@ def get_tokenizers(args):
             "subfolder": "tokenizer",
             "revision": args.revision,
         }
-        if not args.pixart_sigma and not args.aura_flow:
-            tokenizer_1 = CLIPTokenizer.from_pretrained(**tokenizer_kwargs)
+        is_t5_model = False
+        if args.pixart_sigma:
+            from transformers import T5Tokenizer
+
+            tokenizer_cls = T5Tokenizer
+            is_t5_model = True
+        elif args.aura_flow:
+            from transformers import LlamaTokenizerFast
+
+            tokenizer_cls = LlamaTokenizerFast
+            is_t5_model = True
+        elif args.kolors:
+            from diffusers import ChatGLMTokenizer
+
+            tokenizer_cls = ChatGLMTokenizer
+            tokenizer_1 = tokenizer_cls.from_pretrained(
+                args.pretrained_model_name_or_path,
+                subfolder="tokenizer",
+                revision=args.revision,
+                use_fast=False,
+            )
         else:
-            if args.pixart_sigma:
-                from transformers import T5Tokenizer
+            tokenizer_1 = CLIPTokenizer.from_pretrained(**tokenizer_kwargs)
 
-                tokenizer_cls = T5Tokenizer
-            elif args.aura_flow:
-                from transformers import LlamaTokenizerFast
-
-                tokenizer_cls = LlamaTokenizerFast
-
+        if is_t5_model:
             text_encoder_path = (
                 args.pretrained_t5_model_name_or_path
                 if args.pretrained_t5_model_name_or_path is not None
@@ -191,7 +208,7 @@ def get_tokenizers(args):
         )
         if args.sd3:
             raise e
-    if not args.pixart_sigma and not args.aura_flow:
+    if not any([args.pixart_sigma, args.aura_flow, args.kolors]):
         try:
             tokenizer_2 = CLIPTokenizer.from_pretrained(
                 args.pretrained_model_name_or_path,
@@ -248,6 +265,8 @@ def main():
         StateTracker.set_model_type("legacy")
     if args.hunyuan_dit:
         StateTracker.set_model_type("hunyuan_dit")
+    if args.kolors:
+        StateTracker.set_model_type("kolors")
 
     StateTracker.set_args(args)
     if not args.preserve_data_backend_cache:
@@ -391,19 +410,23 @@ def main():
     text_encoder_1, text_encoder_2, text_encoder_3 = None, None, None
     text_encoders = []
     tokenizers = []
-    if not args.pixart_sigma and not args.aura_flow:
-        # sdxl and sd3 use the sd 1.5 clip-L/14 as number one.
-        # sd2.x uses openclip vit-H/14
-        logger.info("Load CLIP text encoder..")
-        text_encoder_path = args.pretrained_model_name_or_path
+    if args.kolors:
+        logger.info("Loading Kolors ChatGLM language model..")
+        text_encoder_path = "kwai-kolors/kolors-diffusers"
         text_encoder_subfolder = "text_encoder"
-    else:
+    elif args.pixart_sigma or args.aura_flow:
         text_encoder_path = (
             args.pretrained_t5_model_name_or_path
             if args.pretrained_t5_model_name_or_path is not None
             else args.pretrained_model_name_or_path
         )
         # Google's version of the T5 XXL model doesn't have a subfolder :()
+        text_encoder_subfolder = "text_encoder"
+    else:
+        # sdxl and sd3 use the sd 1.5 clip-L/14 as number one.
+        # sd2.x uses openclip vit-H/14
+        logger.info("Load CLIP text encoder..")
+        text_encoder_path = args.pretrained_model_name_or_path
         text_encoder_subfolder = "text_encoder"
     if tokenizer_1 is not None:
         text_encoder_cls_1 = import_model_class_from_model_name_or_path(
@@ -424,7 +447,7 @@ def main():
 
     # Load scheduler and models
     flow_matching = False
-    if (args.sd3 and not args.sd3_uses_diffusion) or args.aura_flow:
+    if (args.sd3 or args.aura_flow) and args.flow_matching_loss != "diffusion":
         # Stable Diffusion 3 and AuraFlow use rectified flow.
         flow_matching = True
         from diffusers import FlowMatchEulerDiscreteScheduler
@@ -446,9 +469,9 @@ def main():
             timestep_spacing=args.training_scheduler_timestep_spacing,
         )
         args.prediction_type = noise_scheduler.config.prediction_type
-        if args.sd3 and args.sd3_uses_diffusion:
+        if flow_matching and args.flow_matching_loss == "diffusion":
             logger.warning(
-                "Since --sd3_uses_diffusion is provided, we will be reparameterising the model to v-prediction diffusion objective. This will break things for a while. Perhaps forever.."
+                "Since --flow_matching_loss=diffusion, we will be reparameterising the model to v-prediction diffusion objective. This will break things for a while. Perhaps forever.."
             )
     # Currently Accelerate doesn't know how to handle multiple models under Deepspeed ZeRO stage 3.
     # For this to work properly all models must be run through `accelerate.prepare`. But accelerate
@@ -460,11 +483,17 @@ def main():
     # `from_pretrained` So CLIPTextModel and AutoencoderKL will not enjoy the parameter sharding
     # across multiple gpus and only UNet2DConditionModel will get ZeRO sharded.
     with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
+        text_encoder_variant = args.variant
         if tokenizer_1 is not None:
             if args.pixart_sigma or args.aura_flow:
                 logger.info(
                     f"Loading {'T5-XXL v1.1' if not args.aura_flow else 'Eleuther-AI Pile T5-XL'} text encoder from {text_encoder_path}/{text_encoder_subfolder}.."
                 )
+            elif args.kolors:
+                logger.info(
+                    f"Loading ChatGLM language model from {text_encoder_path}/{text_encoder_subfolder}.."
+                )
+                text_encoder_variant = "fp16"
             else:
                 logger.info(
                     f"Loading CLIP text encoder from {text_encoder_path}/{text_encoder_subfolder}.."
@@ -473,7 +502,7 @@ def main():
                 text_encoder_path,
                 subfolder=text_encoder_subfolder,
                 revision=args.revision,
-                variant=args.variant,
+                variant=text_encoder_variant,
             )
 
         if tokenizer_2 is not None:
@@ -584,7 +613,15 @@ def main():
         )
     else:
         logger.info("Loading U-net..")
+        unet_variant = args.variant
+        if (
+            args.kolors
+            and args.pretrained_model_name_or_path.lower()
+            == "kwai-kolors/kolors-diffusers"
+        ):
+            unet_variant = "fp16"
         transformer = None
+        pretrained_load_args["variant"] = unet_variant
         unet = UNet2DConditionModel.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="unet", **pretrained_load_args
         )
@@ -604,6 +641,8 @@ def main():
         model_type_label = "DeepFloyd-IF"
     if args.hunyuan_dit:
         model_type_label = "Hunyuan DiT"
+    if args.kolors:
+        model_type_label = "Kwai Kolors"
 
     AURA_DIT_BLOCKS_REGEX = (
         r"single_transformer_blocks\..*\.attn\.to_([kvq]|out\.0\.weight)"
@@ -738,6 +777,7 @@ def main():
         transformer = freeze_transformer_blocks(
             transformer,
             target_blocks=args.aura_flow_target,
+            freeze_direction=args.aura_flow_freeze_direction,
             first_unfrozen_dit_layer=args.aura_flow_first_unfrozen_dit_layer,
             first_unfrozen_mmdit_layer=args.aura_flow_first_unfrozen_mmdit_layer,
             use_bitfit=True if args.layer_freeze_strategy == "bitfit" else False,
@@ -773,13 +813,10 @@ def main():
 
     # Create a DataBackend, so that we can access our dataset.
     prompt_handler = None
-    if (
-        not args.disable_compel
-        and not args.sd3
-        and not args.pixart_sigma
-        and not args.aura_flow
+    if not args.disable_compel and not any(
+        [args.sd3, args.pixart_sigma, args.aura_flow, args.kolors]
     ):
-        # SD3 and PixArt don't really work with prompt weighting.
+        # Only CLIP works with prompt weighting.
         prompt_handler = PromptHandler(
             args=args,
             text_encoders=[text_encoder_1, text_encoder_2],
@@ -811,7 +848,7 @@ def main():
 
         sys.exit(0)
 
-    with accelerator.main_process_first():
+    if accelerator.is_main_process:
         (
             validation_prompts,
             validation_shortnames,
@@ -820,10 +857,15 @@ def main():
         ) = prepare_validation_prompt_list(
             args=args, embed_cache=StateTracker.get_default_text_embed_cache()
         )
+    else:
+        validation_prompts = None
+        validation_shortnames = None
+        validation_negative_prompt_embeds = None
+        validation_negative_pooled_embeds = None
     accelerator.wait_for_everyone()
-    # Grab GPU memory used:
 
     if args.model_type == "full" or not args.train_text_encoder:
+        # Grab GPU memory used:
         if torch.cuda.is_available():
             memory_before_unload = torch.cuda.memory_allocated() / 1024**3
         elif torch.backends.mps.is_available():
@@ -920,8 +962,8 @@ def main():
         if hasattr(args, "train_text_encoder") and args.train_text_encoder:
             text_encoder_1.gradient_checkpointing_enable()
             text_encoder_2.gradient_checkpointing_enable()
-            if text_encoder_3:
-                text_encoder_3.gradient_checkpointing_enable()
+            # if text_encoder_3:
+            #     text_encoder_3.gradient_checkpointing_enable()
 
     logger.info(f"Learning rate: {args.learning_rate}")
     extra_optimizer_args = {
@@ -1287,6 +1329,8 @@ def main():
 
     if "lora" in args.model_type and args.train_text_encoder:
         logger.info("Preparing text encoders for training.")
+        if args.sd3:
+            logger.info("NOTE: The third text encoder is not trained for SD3.")
         text_encoder_1, text_encoder_2 = accelerator.prepare(
             text_encoder_1, text_encoder_2
         )
@@ -1359,6 +1403,7 @@ def main():
     global_step = 0
     global_resume_step = 0
     StateTracker.set_global_step(global_step)
+
     # First_epoch represents the *currently training epoch*, as opposed to global_step, which represents
     #  the *last completed* optimization step.
     first_epoch = 1
@@ -1636,7 +1681,8 @@ def main():
             iterator_fn = bf.next_response
 
         while True:
-            step, batch = iterator_fn(*iterator_args)
+            step += 1
+            batch = iterator_fn(step, *iterator_args)
             training_logger.debug(f"Iterator: {iterator_fn}")
             if args.lr_scheduler == "cosine_with_restarts":
                 scheduler_kwargs["step"] = global_step
@@ -1750,7 +1796,9 @@ def main():
                         n_dim=latents.ndim,
                         dtype=latents.dtype,
                     )
-                    noisy_latents = sigmas * noise + (1.0 - sigmas) * latents
+                    noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
+                    # is equal to:
+                    # zt = (1 - texp) * x + texp * z1
                 else:
                     # Add noise to the latents according to the noise magnitude at each timestep
                     # (this is the forward diffusion process)
@@ -1772,14 +1820,17 @@ def main():
                 # Get the target for loss depending on the prediction type
                 if flow_matching:
                     # This is the flow-matching target for vanilla SD3.
-                    # If sd3_uses_diffusion, we will instead use v_prediction (see below)
-                    target = latents
+                    # If flow_matching_loss == "diffusion", we will instead use v_prediction (see below)
+                    if args.flow_matching_loss == "diffusers":
+                        target = latents
+                    elif args.flow_matching_loss == "compatible":
+                        target = noise - latents
                 elif noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
                 elif noise_scheduler.config.prediction_type == "v_prediction" or (
-                    args.sd3 and args.sd3_uses_diffusion
+                    flow_matching and args.flow_matching_loss == "diffusion"
                 ):
-                    # When not using flow-matching, SD3 is trained on velocity prediction objective.
+                    # When not using flow-matching, train on velocity prediction objective.
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 elif noise_scheduler.config.prediction_type == "sample":
                     # We set the target to latents here, but the model_pred will return the noise sample prediction.
@@ -1795,7 +1846,7 @@ def main():
                 if args.sd3 or args.aura_flow:
                     # Even if we're using DDPM process, we don't add in extra kwargs, which are SDXL-specific.
                     added_cond_kwargs = None
-                elif StateTracker.get_model_type() == "sdxl":
+                elif StateTracker.get_model_type() == "sdxl" or args.kolors:
                     added_cond_kwargs = {
                         "text_embeds": add_text_embeds.to(
                             device=accelerator.device, dtype=weight_dtype
@@ -1886,12 +1937,14 @@ def main():
                         model_pred = model_pred.chunk(2, dim=1)[0]
                     elif unet is not None:
                         if args.legacy:
+                            # SD 1.5 or 2.x
                             model_pred = unet(
                                 noisy_latents,
                                 timesteps,
                                 encoder_hidden_states,
                             ).sample
                         else:
+                            # SDXL, Kolors, other default unet prediction.
                             model_pred = unet(
                                 noisy_latents,
                                 timesteps,
@@ -1909,7 +1962,11 @@ def main():
                 if flow_matching:
                     # Follow: Section 5 of https://arxiv.org/abs/2206.00364.
                     # Preconditioning of the model outputs.
-                    model_pred = model_pred * (-sigmas) + noisy_latents
+                    if args.flow_matching_loss == "diffusers":
+                        model_pred = model_pred * (-sigmas) + noisy_latents
+                    elif args.flow_matching_loss == "compatible":
+                        # we shouldn't mess with the model prediction.
+                        pass
 
                 # x-prediction requires that we now subtract the noise residual from the prediction to get the target sample.
                 if (
@@ -1952,7 +2009,7 @@ def main():
                     snr = compute_snr(timesteps, noise_scheduler)
                     snr_divisor = snr
                     if noise_scheduler.config.prediction_type == "v_prediction" or (
-                        args.sd3 and args.sd3_uses_diffusion
+                        flow_matching and args.flow_matching_loss == "diffusion"
                     ):
                         snr_divisor = snr + 1
 
@@ -2216,18 +2273,20 @@ def main():
                     )
                     if args.sd3:
                         text_encoder_3 = accelerator.unwrap_model(text_encoder_3)
-                        text_encoder_3_lora_layers = convert_state_dict_to_diffusers(
-                            get_peft_model_state_dict(text_encoder_3)
-                        )
+                        # text_encoder_3_lora_layers = convert_state_dict_to_diffusers(
+                        #     get_peft_model_state_dict(text_encoder_3)
+                        # )
             else:
                 text_encoder_lora_layers = None
                 text_encoder_2_lora_layers = None
-                text_encoder_3_lora_layers = None
+                # text_encoder_3_lora_layers = None
 
             if args.sd3:
                 StableDiffusion3Pipeline.save_lora_weights(
                     save_directory=args.output_dir,
                     transformer_lora_layers=transformer_lora_layers,
+                    text_encoder_lora_layers=text_encoder_lora_layers,
+                    text_encoder_2_lora_layers=text_encoder_2_lora_layers,
                 )
             else:
                 StableDiffusionXLPipeline.save_lora_weights(
@@ -2305,7 +2364,7 @@ def main():
                     ),
                     transformer=transformer,
                 )
-                if args.sd3_uses_diffusion:
+                if flow_matching and args.flow_matching_loss == "diffusion":
                     # Diffusion-based SD3 is currently fixed to a Euler v-prediction schedule.
                     pipeline.scheduler = SCHEDULER_NAME_MAP["euler"].from_pretrained(
                         args.pretrained_model_name_or_path,
@@ -2388,7 +2447,12 @@ def main():
                 )
 
             else:
-                pipeline = StableDiffusionXLPipeline.from_pretrained(
+                sdxl_pipeline_cls = StableDiffusionXLPipeline
+                if args.kolors:
+                    from helpers.kolors.pipeline import KolorsPipeline
+
+                    sdxl_pipeline_cls = KolorsPipeline
+                pipeline = sdxl_pipeline_cls.from_pretrained(
                     args.pretrained_model_name_or_path,
                     text_encoder=(
                         text_encoder_cls_1.from_pretrained(

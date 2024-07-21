@@ -171,7 +171,9 @@ if [ -n "$STABLE_DIFFUSION_LEGACY" ] && [[ "$STABLE_DIFFUSION_LEGACY" == "true" 
 if [ -n "$HUNYUAN_DIT" ] && [[ "$HUNYUAN_DIT" == "true" ]]; then
     export TRAINER_EXTRA_ARGS="${TRAINER_EXTRA_ARGS} --hunyuan_dit"
 fi
-
+if [ -n "$KOLORS" ] && [[ "$KOLORS" == "true" ]]; then
+    export TRAINER_EXTRA_ARGS="${TRAINER_EXTRA_ARGS} --kolors"
+fi
 
 export EMA_ARGS=""
 if [ -n "$USE_EMA" ] && [[ "$USE_EMA" == "true" ]]; then

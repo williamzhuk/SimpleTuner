@@ -2,7 +2,7 @@
 
 > ⚠️ **Warning**: The scripts in this repository have the potential to damage your training data. Always maintain backups before proceeding.
 
-**SimpleTuner** is a repository dedicated to a set of experimental scripts designed for training optimization. The project is geared towards simplicity, with a focus on making the code easy to read and understand. This codebase serves as a shared academic exercise, and contributions to its improvement are welcome.
+**SimpleTuner** is a repository dedicated to a set of experimental scripts designed for training optimization. The project is geared towards simplicity, with a focus on making the code easy to read and understand. This codebase serves as a shared academic exercise, and contributions are welcome.
 
 - Multi-GPU training
 - Aspect bucketing "just works"; fill a folder of images and let it rip
@@ -105,6 +105,13 @@ AuraFlow has some distinct advantages that make it worth investigating over Stab
 ### Hunyian-DiT
 
 _Placeholder text._
+
+
+### Kwai Kolors
+
+An SDXL-based model with ChatGLM (General Language Model) 6B as its text encoder, **doubling** the hidden dimension size and substantially increasing the level of local detail included in the prompt embeds.
+
+Kolors support is almost as deep as SDXL, minus ControlNet training support.
 
 ---
 

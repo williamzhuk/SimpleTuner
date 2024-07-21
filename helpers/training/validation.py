@@ -217,7 +217,7 @@ def prepare_validation_prompt_list(args, embed_cache):
     # Compute negative embed for validation prompts, if any are set.
     if validation_prompts:
         logger.info("Precomputing the negative prompt embed for validations.")
-        if model_type == "sdxl" or model_type == "sd3":
+        if model_type == "sdxl" or model_type == "sd3" or model_type == "kolors":
             (
                 validation_negative_prompt_embeds,
                 validation_negative_pooled_embeds,
@@ -425,8 +425,8 @@ class Validation:
         self.text_encoder_3 = text_encoder_3
         self.tokenizer_3 = tokenizer_3
         self.flow_matching = (
-            self.args.sd3 and not self.args.sd3_uses_diffusion
-        ) or self.args.aura_flow
+            self.args.sd3 or self.args.aura_flow
+        ) and self.args.flow_matching_loss != "diffusion"
 
         self._update_state()
 
@@ -508,6 +508,24 @@ class Validation:
             if self.args.validation_using_datasets:
                 return StableDiffusionXLImg2ImgPipeline
             return StableDiffusionXLPipeline
+        elif model_type == "kolors":
+            if self.args.controlnet:
+                raise NotImplementedError("Kolors ControlNet is not yet supported.")
+            if self.args.validation_using_datasets:
+                try:
+                    from helpers.kolors.pipeline import KolorsImg2ImgPipeline
+                except:
+                    logger.error(
+                        "Kolors pipeline requires the latest version of Diffusers."
+                    )
+                return KolorsImg2ImgPipeline
+            try:
+                from helpers.kolors.pipeline import KolorsPipeline
+            except Exception:
+                logger.error(
+                    "Kolors pipeline requires the latest version of Diffusers."
+                )
+            return KolorsPipeline
         elif model_type == "legacy":
             if self.deepfloyd_stage2:
                 from diffusers.pipelines import IFSuperResolutionPipeline
@@ -547,7 +565,6 @@ class Validation:
                 logger.error(
                     "Could not import AuraFlow pipeline. Perhaps you need a git-source version of Diffusers."
                 )
-                raise NotImplementedError("AuraFlow pipeline not available.")
 
             return AuraFlowPipeline
 
@@ -557,6 +574,7 @@ class Validation:
         if (
             StateTracker.get_model_type() == "sdxl"
             or StateTracker.get_model_type() == "sd3"
+            or StateTracker.get_model_type() == "kolors"
         ):
             (
                 current_validation_prompt_embeds,
@@ -663,6 +681,11 @@ class Validation:
                         device=self.accelerator.device, dtype=self.weight_dtype
                     )
                 )
+        else:
+            raise NotImplementedError(
+                f"Model type {StateTracker.get_model_type()} not implemented for validation."
+            )
+
         current_validation_prompt_embeds = current_validation_prompt_embeds.to(
             device=self.accelerator.device, dtype=self.weight_dtype
         )
@@ -685,6 +708,79 @@ class Validation:
             prompt_embeds["negative_mask"] = self.validation_negative_prompt_mask
 
         return prompt_embeds
+
+    def stitch_benchmark_images(self, validation_image_results, benchmark_image):
+        """
+        For each image, make a new canvas and place it side by side with its equivalent from {self.validation_image_inputs}
+        """
+        stitched_validation_images = []
+        for idx, image in enumerate(validation_image_results):
+            new_width = image.size[0] * 2
+            new_height = image.size[1]
+            new_image = Image.new("RGB", (new_width, new_height))
+            new_image.paste(image, (0, 0))
+            new_image.paste(benchmark_image, (image.size[0], 0))
+            stitched_validation_images.append(new_image)
+
+        return stitched_validation_images
+
+    def _benchmark_image(self, shortname):
+        """
+        We will retrieve the benchmark image for the shortname.
+        """
+        if not self.benchmark_exists():
+            return None
+        base_model_benchmark = os.path.join(self.args.output_dir, "benchmark")
+        benchmark_image = None
+        for _benchmark_image in os.listdir(base_model_benchmark):
+            if _benchmark_image.startswith(shortname):
+                benchmark_image = Image.open(
+                    os.path.join(base_model_benchmark, _benchmark_image)
+                )
+                break
+
+        return benchmark_image
+
+    def _benchmark_images(self):
+        """
+        We will retrieve the benchmark images so they can be stitched to the validation outputs.
+        """
+        if not self.benchmark_exists():
+            return None
+        benchmark_images = []
+        base_model_benchmark = os.path.join(self.args.output_dir, "benchmark")
+        for _benchmark_image in os.listdir(base_model_benchmark):
+            if _benchmark_image.endswith(".png"):
+                benchmark_images.append(
+                    (
+                        _benchmark_image.replace(".png", ""),
+                        f"Base model benchmark image {_benchmark_image}",
+                        Image.open(
+                            os.path.join(base_model_benchmark, _benchmark_image)
+                        ),
+                    )
+                )
+
+        return benchmark_images
+
+    def benchmark_exists(self):
+        """
+        Determines whether the base model benchmark outputs already exist.
+        """
+        base_model_benchmark = os.path.join(self.args.output_dir, "benchmark")
+
+        return os.path.exists(base_model_benchmark)
+
+    def save_benchmark(self):
+        """
+        Saves the benchmark outputs for the base model.
+        """
+        base_model_benchmark = os.path.join(self.args.output_dir, "benchmark")
+        if not os.path.exists(base_model_benchmark):
+            os.makedirs(base_model_benchmark, exist_ok=True)
+        benchmark_images = self.validation_images
+        for shortname, prompt, image in benchmark_images:
+            image.save(os.path.join(base_model_benchmark, f"{shortname}.png"))
 
     def _update_state(self):
         """Updates internal state with the latest from StateTracker."""
@@ -996,10 +1092,13 @@ class Validation:
             else:
                 validation_resolution_width, validation_resolution_height = resolution
 
-            if (
-                not self.deepfloyd
-                and not self.args.pixart_sigma
-                and not self.flow_matching
+            if not any(
+                [
+                    self.deepfloyd,
+                    self.args.pixart_sigma,
+                    self.flow_matching,
+                    self.args.kolors,
+                ]
             ):
                 extra_validation_kwargs["guidance_rescale"] = (
                     self.args.validation_guidance_rescale
@@ -1073,6 +1172,8 @@ class Validation:
                     validation_image_results = self.stitch_conditioning_images(
                         validation_image_results, extra_validation_kwargs["image"]
                     )
+                # if self.benchmark_exists():
+
                 validation_images[validation_shortname].extend(validation_image_results)
             except Exception as e:
                 import traceback

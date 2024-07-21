@@ -142,7 +142,8 @@ class SaveHookManager:
         transformer_lora_layers_to_save = None
         text_encoder_1_lora_layers_to_save = None
         text_encoder_2_lora_layers_to_save = None
-        text_encoder_3_lora_layers_to_save = None
+        # Diffusers does not train the third text encoder.
+        # text_encoder_3_lora_layers_to_save = None
 
         for model in models:
             if isinstance(model, type(unwrap_model(self.accelerator, self.unet))):
@@ -161,12 +162,12 @@ class SaveHookManager:
                 text_encoder_2_lora_layers_to_save = convert_state_dict_to_diffusers(
                     get_peft_model_state_dict(model)
                 )
-            elif isinstance(
-                model, type(unwrap_model(self.accelerator, self.text_encoder_3))
-            ):
-                text_encoder_3_lora_layers_to_save = convert_state_dict_to_diffusers(
-                    get_peft_model_state_dict(model)
-                )
+            # elif isinstance(
+            #     model, type(unwrap_model(self.accelerator, self.text_encoder_3))
+            # ):
+            #     text_encoder_3_lora_layers_to_save = convert_state_dict_to_diffusers(
+            #         get_peft_model_state_dict(model)
+            #     )
 
             elif not isinstance(
                 model, type(unwrap_model(self.accelerator, HunyuanDiT2DModel))
@@ -188,9 +189,9 @@ class SaveHookManager:
                 output_dir,
                 transformer_lora_layers=transformer_lora_layers_to_save,
                 # SD3 doesn't support text encoder training.
-                text_encoder_1_lora_layers_to_save=text_encoder_1_lora_layers_to_save,
-                text_encoder_2_lora_layers_to_save=text_encoder_2_lora_layers_to_save,
-                text_encoder_3_lora_layers_to_save=text_encoder_3_lora_layers_to_save,
+                text_encoder_lora_layers=text_encoder_1_lora_layers_to_save,
+                text_encoder_2_lora_layers=text_encoder_2_lora_layers_to_save,
+                # text_encoder_3_lora_layers_to_save=text_encoder_3_lora_layers_to_save,
             )
         elif self.args.legacy:
             StableDiffusionPipeline.save_lora_weights(
