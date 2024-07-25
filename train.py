@@ -523,13 +523,21 @@ def main():
             )
 
         logger.info(f"Load VAE: {vae_path}")
-        vae = AutoencoderKL.from_pretrained(
-            vae_path,
-            subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
-            revision=args.revision,
-            force_upcast=False,
-            variant=args.variant,
-        )
+        vae_kwargs = {
+            "pretrained_model_name_or_path": vae_path,
+            "subfolder": "vae",
+            "revision": args.revision,
+            "force_upcast": False,
+            "variant": args.variant,
+        }
+        try:
+            vae = AutoencoderKL.from_pretrained(**vae_kwargs)
+        except:
+            logger.warning(
+                "Couldn't load VAE with default path. Trying without a subfolder.."
+            )
+            vae_kwargs["subfolder"] = None
+            vae = AutoencoderKL.from_pretrained(**vae_kwargs)
 
     if tokenizer_1 is not None:
         logger.info("Moving text encoder to GPU.")
@@ -2052,6 +2060,13 @@ def main():
                             f"NaNs detected. Loss: {loss}, Model prediction: {model_pred}, Target: {target}"
                         )
                     accelerator.backward(loss)
+
+                    if args.gradient_precision == "fp32":
+                        # After backward, convert gradients to fp32 for stable accumulation
+                        for param in params_to_optimize:
+                            if param.grad is not None:
+                                param.grad.data = param.grad.data.to(torch.float32)
+
                     grad_norm = None
                     if (
                         accelerator.sync_gradients
