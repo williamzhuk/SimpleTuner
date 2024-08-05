@@ -1,6 +1,8 @@
 from helpers.data_backend.local import LocalDataBackend
 from helpers.data_backend.aws import S3DataBackend
+from helpers.data_backend.csv import CSVDataBackend
 from helpers.data_backend.base import BaseDataBackend
+from helpers.training.default_settings import default, latest_config_version
 from helpers.caching.text_embeds import TextEmbeddingCache
 
 from helpers.training.exceptions import MultiDatasetExhausted
@@ -8,7 +10,7 @@ from helpers.multiaspect.dataset import MultiAspectDataset
 from helpers.multiaspect.sampler import MultiAspectSampler
 from helpers.prompts import PromptHandler
 from helpers.caching.vae import VAECache
-from helpers.training.multi_process import rank_info, _get_rank as get_rank
+from helpers.training.multi_process import should_log, rank_info, _get_rank as get_rank
 from helpers.training.collate import collate_fn
 from helpers.training.state_tracker import StateTracker
 
@@ -19,12 +21,19 @@ import logging
 import io
 import time
 import threading
+from tqdm import tqdm
 import queue
 
 logger = logging.getLogger("DataBackendFactory")
-logger.setLevel(os.environ.get("SIMPLETUNER_LOG_LEVEL", "INFO"))
+if should_log():
+    logger.setLevel(os.environ.get("SIMPLETUNER_LOG_LEVEL", "INFO"))
+else:
+    logger.setLevel(logging.ERROR)
 prefetch_log = logging.getLogger("DataBackendPrefetch")
-prefetch_log.setLevel(os.environ.get("SIMPLETUNER_PREFETCH_LOG_LEVEL", "INFO"))
+if should_log():
+    prefetch_log.setLevel(os.environ.get("SIMPLETUNER_PREFETCH_LOG_LEVEL", "INFO"))
+else:
+    prefetch_log.setLevel(logging.ERROR)
 
 # For prefetching.
 
@@ -83,6 +92,13 @@ def init_backend_config(backend: dict, args: dict, accelerator) -> dict:
         output["config"]["crop"] = backend["crop"]
     else:
         output["config"]["crop"] = False
+    if backend.get("type") == "csv":
+        if "csv_cache_dir" in backend:
+            output["config"]["csv_cache_dir"] = backend["csv_cache_dir"]
+        if "csv_file" in backend:
+            output["config"]["csv_file"] = backend["csv_file"]
+        if "csv_caption_column" in backend:
+            output["config"]["csv_caption_column"] = backend["csv_caption_column"]
     if "crop_aspect" in backend:
         choices = ["square", "preserve", "random"]
         if backend.get("crop_aspect", None) not in choices:
@@ -126,9 +142,13 @@ def init_backend_config(backend: dict, args: dict, accelerator) -> dict:
         output["config"]["caption_strategy"] = backend["caption_strategy"]
     else:
         output["config"]["caption_strategy"] = args.caption_strategy
-    output["config"]["instance_data_root"] = backend.get(
+    output["config"]["instance_data_dir"] = backend.get(
         "instance_data_dir", backend.get("aws_data_prefix", "")
     )
+    if "hash_filenames" in backend:
+        output["config"]["hash_filenames"] = backend["hash_filenames"]
+    if "shorten_filenames" in backend and backend.get("type") == "csv":
+        output["config"]["shorten_filenames"] = backend["shorten_filenames"]
 
     # check if caption_strategy=parquet with metadata_backend=json
     if (
@@ -136,7 +156,7 @@ def init_backend_config(backend: dict, args: dict, accelerator) -> dict:
         and backend.get("metadata_backend", "json") == "json"
     ):
         raise ValueError(
-            f"(id={backend['id']}) Cannot use caption_strategy=parquet with metadata_backend=json."
+            f"(id={backend['id']}) Cannot use caption_strategy=parquet with metadata_backend=json. Instead, it is recommended to use the textfile strategy and extract your captions into txt files."
         )
 
     maximum_image_size = backend.get("maximum_image_size", args.maximum_image_size)
@@ -164,6 +184,7 @@ def init_backend_config(backend: dict, args: dict, accelerator) -> dict:
         and output["config"]["resolution_type"] == "pixel"
         and maximum_image_size < 512
         and "deepfloyd" not in args.model_type
+        and not args.smoldit
     ):
         raise ValueError(
             f"When a data backend is configured to use `'resolution_type':pixel`, `maximum_image_size` must be at least 512 pixels. You may have accidentally entered {maximum_image_size} megapixels, instead of pixels."
@@ -182,6 +203,7 @@ def init_backend_config(backend: dict, args: dict, accelerator) -> dict:
         and output["config"]["resolution_type"] == "pixel"
         and target_downsample_size < 512
         and "deepfloyd" not in args.model_type
+        and not args.smoldit
     ):
         raise ValueError(
             f"When a data backend is configured to use `'resolution_type':pixel`, `target_downsample_size` must be at least 512 pixels. You may have accidentally entered {target_downsample_size} megapixels, instead of pixels."
@@ -193,17 +215,17 @@ def init_backend_config(backend: dict, args: dict, accelerator) -> dict:
 def print_bucket_info(metadata_backend):
     # Print table header
     if get_rank() == 0:
-        print(f"{rank_info()} | {'Bucket':<10} | {'Image Count (per-GPU)':<12}")
+        tqdm.write(f"{rank_info()} | {'Bucket':<10} | {'Image Count (per-GPU)':<12}")
 
         # Print separator
-        print("-" * 30)
+        tqdm.write("-" * 30)
 
         # Print each bucket's information
         for bucket in metadata_backend.aspect_ratio_bucket_indices:
             image_count = len(metadata_backend.aspect_ratio_bucket_indices[bucket])
             if image_count == 0:
                 continue
-            print(f"{rank_info()} | {bucket:<10} | {image_count:<12}")
+            tqdm.write(f"{rank_info()} | {bucket:<10} | {image_count:<12}")
 
 
 def configure_parquet_database(backend: dict, args, data_backend: BaseDataBackend):
@@ -225,7 +247,11 @@ def configure_parquet_database(backend: dict, args, data_backend: BaseDataBacken
 
     bytes_string = data_backend.read(parquet_path)
     pq = io.BytesIO(bytes_string)
-    df = pd.read_parquet(pq)
+    if parquet_path.endswith(".jsonl"):
+        df = pd.read_json(pq, lines=True)
+    else:
+        df = pd.read_parquet(pq)
+
     caption_column = parquet_config.get(
         "caption_column", args.parquet_caption_column or "description"
     )
@@ -351,10 +377,15 @@ def configure_multi_databackend(
                 aws_access_key_id=backend["aws_access_key_id"],
                 aws_secret_access_key=backend["aws_secret_access_key"],
                 accelerator=accelerator,
+                max_pool_connections=backend.get(
+                    "max_pool_connections", args.aws_max_pool_connections
+                ),
             )
             # S3 buckets use the aws_data_prefix as their prefix/ for all data.
             # Ensure we have a trailing slash on the prefix:
             init_backend["cache_dir"] = backend.get("aws_data_prefix", None)
+        elif backend["type"] == "csv":
+            raise ValueError("Cannot use CSV backend for text embed storage.")
         else:
             raise ValueError(f"Unknown data backend type: {backend['type']}")
 
@@ -456,10 +487,15 @@ def configure_multi_databackend(
                 aws_access_key_id=backend["aws_access_key_id"],
                 aws_secret_access_key=backend["aws_secret_access_key"],
                 accelerator=accelerator,
+                max_pool_connections=backend.get(
+                    "max_pool_connections", args.aws_max_pool_connections
+                ),
             )
             # S3 buckets use the aws_data_prefix as their prefix/ for all data.
             # Ensure we have a trailing slash on the prefix:
             init_backend["cache_dir"] = backend.get("aws_data_prefix", None)
+        elif backend["type"] == "csv":
+            raise ValueError("Cannot use CSV backend for image embed storage.")
         else:
             raise ValueError(f"Unknown data backend type: {backend['type']}")
 
@@ -498,7 +534,6 @@ def configure_multi_databackend(
         info_log(f"Configuring data backend: {backend['id']}")
         # Retrieve some config file overrides for commandline arguments, eg. cropping
         init_backend = init_backend_config(backend, args, accelerator)
-        info_log(f"Configured backend: {init_backend}")
         StateTracker.set_data_backend_config(
             data_backend_id=init_backend["id"],
             config=init_backend["config"],
@@ -518,10 +553,19 @@ def configure_multi_databackend(
             init_backend["data_backend"] = get_local_backend(
                 accelerator, init_backend["id"], compress_cache=args.compress_disk_cache
             )
-            init_backend["instance_data_root"] = backend["instance_data_dir"]
+            init_backend["instance_data_dir"] = backend.get(
+                "instance_data_dir", backend.get("instance_data_root")
+            )
+            if init_backend["instance_data_dir"] is None:
+                raise ValueError(
+                    "A local backend requires instance_data_dir be defined and pointing to the image data directory."
+                )
             # Remove trailing slash
-            if init_backend["instance_data_root"][-1] == "/":
-                init_backend["instance_data_root"] = init_backend["instance_data_root"][
+            if (
+                init_backend["instance_data_dir"] is not None
+                and init_backend["instance_data_dir"][-1] == "/"
+            ):
+                init_backend["instance_data_dir"] = init_backend["instance_data_dir"][
                     :-1
                 ]
         elif backend["type"] == "aws":
@@ -535,9 +579,34 @@ def configure_multi_databackend(
                 aws_secret_access_key=backend["aws_secret_access_key"],
                 accelerator=accelerator,
                 compress_cache=args.compress_disk_cache,
+                max_pool_connections=backend.get(
+                    "max_pool_connections", args.aws_max_pool_connections
+                ),
             )
             # S3 buckets use the aws_data_prefix as their prefix/ for all data.
-            init_backend["instance_data_root"] = backend["aws_data_prefix"]
+            init_backend["instance_data_dir"] = backend["aws_data_prefix"]
+        elif backend["type"] == "csv":
+            check_csv_config(backend=backend, args=args)
+            init_backend["data_backend"] = get_csv_backend(
+                accelerator=accelerator,
+                id=backend["id"],
+                csv_file=backend["csv_file"],
+                csv_cache_dir=backend["csv_cache_dir"],
+                compress_cache=args.compress_disk_cache,
+                shorten_filenames=backend.get("shorten_filenames", False),
+            )
+            # init_backend["instance_data_dir"] = backend.get("instance_data_dir", backend.get("instance_data_root", backend.get("csv_cache_dir")))
+            init_backend["instance_data_dir"] = None
+            # if init_backend["instance_data_dir"] is None:
+            #     raise ValueError("CSV backend requires one of instance_data_dir, instance_data_root or csv_cache_dir to be set, as we require a location to place metadata lists.")
+            # Remove trailing slash
+            if (
+                init_backend["instance_data_dir"] is not None
+                and init_backend["instance_data_dir"][-1] == "/"
+            ):
+                init_backend["instance_data_dir"] = init_backend["instance_data_dir"][
+                    :-1
+                ]
         else:
             raise ValueError(f"Unknown data backend type: {backend['type']}")
 
@@ -552,7 +621,7 @@ def configure_multi_databackend(
             )
         # Do we have a specific VAE embed backend?
         image_embed_backend_id = backend.get("image_embeds", None)
-        image_embed_data_backend = None
+        image_embed_data_backend = init_backend
         if image_embed_backend_id is not None:
             if image_embed_backend_id not in image_embed_backends:
                 raise ValueError(
@@ -577,9 +646,10 @@ def configure_multi_databackend(
                 )
         else:
             raise ValueError(f"Unknown metadata backend type: {metadata_backend}")
+
         init_backend["metadata_backend"] = BucketManager_cls(
             id=init_backend["id"],
-            instance_data_root=init_backend["instance_data_root"],
+            instance_data_dir=init_backend["instance_data_dir"],
             data_backend=init_backend["data_backend"],
             accelerator=accelerator,
             resolution=backend.get("resolution", args.resolution),
@@ -592,11 +662,17 @@ def configure_multi_databackend(
                 "metadata_update_interval", args.metadata_update_interval
             ),
             cache_file=os.path.join(
-                init_backend["instance_data_root"],
+                backend.get(
+                    "instance_data_dir",
+                    backend.get("csv_cache_dir", backend.get("aws_data_prefix", "")),
+                ),
                 "aspect_ratio_bucket_indices",
             ),
             metadata_file=os.path.join(
-                init_backend["instance_data_root"],
+                backend.get(
+                    "instance_data_dir",
+                    backend.get("csv_cache_dir", backend.get("aws_data_prefix", "")),
+                ),
                 "aspect_ratio_bucket_metadata",
             ),
             delete_problematic_images=args.delete_problematic_images or False,
@@ -644,30 +720,45 @@ def configure_multi_databackend(
             "target_downsample_size",
             "parquet",
         ]
+        # we will set the latest version by default.
+        current_config_version = latest_config_version()
         if init_backend["metadata_backend"].config != {}:
             prev_config = init_backend["metadata_backend"].config
-            logger.debug(f"Found existing config: {prev_config}")
+            # if the prev config used an old default config version, we will update defaults here.
+            current_config_version = prev_config.get("config_version", None)
+            if current_config_version is None:
+                # backwards compatibility for non-versioned config files, so that we do not enable life-changing options.
+                current_config_version = 1
+
+            logger.debug(
+                f"Found existing config (version={current_config_version}): {prev_config}"
+            )
             logger.debug(f"Comparing against new config: {init_backend['config']}")
             # Check if any values differ between the 'backend' values and the 'config' values:
             for key, _ in prev_config.items():
                 logger.debug(f"Checking config key: {key}")
-                if (
-                    key in backend
-                    and prev_config[key] != backend[key]
-                    and key not in excluded_keys
-                ):
-                    if not args.override_dataset_config:
-                        raise Exception(
-                            f"Dataset {init_backend['id']} has inconsistent config, and --override_dataset_config was not provided."
-                            f"\n-> Expected value {key}={prev_config[key]} differs from current value={backend[key]}."
-                            f"\n-> Recommended action is to correct the current config values to match the values that were used to create this dataset:"
-                            f"\n{prev_config}"
-                        )
-                    else:
-                        logger.warning(
-                            f"Overriding config value {key}={prev_config[key]} with {backend[key]}"
-                        )
-                        prev_config[key] = backend[key]
+                if key not in excluded_keys:
+                    if key in backend and prev_config[key] != backend[key]:
+                        if not args.override_dataset_config:
+                            raise Exception(
+                                f"Dataset {init_backend['id']} has inconsistent config, and --override_dataset_config was not provided."
+                                f"\n-> Expected value {key}={prev_config.get(key)} differs from current value={backend.get(key)}."
+                                f"\n-> Recommended action is to correct the current config values to match the values that were used to create this dataset:"
+                                f"\n{prev_config}"
+                            )
+                        else:
+                            logger.warning(
+                                f"Overriding config value {key}={prev_config[key]} with {backend[key]}"
+                            )
+                            prev_config[key] = backend[key]
+                    elif key not in backend:
+                        if should_log():
+                            logger.warning(
+                                f"Key {key} not found in the current backend config, using the existing value '{prev_config[key]}'."
+                            )
+                        init_backend["config"][key] = prev_config[key]
+
+        init_backend["config"]["config_version"] = current_config_version
         StateTracker.set_data_backend_config(init_backend["id"], init_backend["config"])
         info_log(f"Configured backend: {init_backend}")
 
@@ -765,7 +856,7 @@ def configure_multi_databackend(
             info_log(f"(id={init_backend['id']}) Collecting captions.")
             captions = PromptHandler.get_all_captions(
                 data_backend=init_backend["data_backend"],
-                instance_data_root=init_backend["instance_data_root"],
+                instance_data_dir=init_backend["instance_data_dir"],
                 prepend_instance_prompt=prepend_instance_prompt,
                 instance_prompt=instance_prompt,
                 use_captions=use_captions,
@@ -788,6 +879,14 @@ def configure_multi_databackend(
         # Register the backend here so the sampler can be found.
         StateTracker.register_data_backend(init_backend)
 
+        default_hash_option = default("hash_filenames", current_config_version)
+        hash_filenames = init_backend.get("config", {}).get(
+            "hash_filenames", default_hash_option
+        )
+        init_backend["config"]["hash_filenames"] = hash_filenames
+        StateTracker.set_data_backend_config(init_backend["id"], init_backend["config"])
+        logger.debug(f"Hashing filenames: {hash_filenames}")
+
         if "deepfloyd" not in StateTracker.get_args().model_type:
             info_log(f"(id={init_backend['id']}) Creating VAE latent cache.")
             init_backend["vaecache"] = VAECache(
@@ -797,7 +896,7 @@ def configure_multi_databackend(
                 metadata_backend=init_backend["metadata_backend"],
                 image_data_backend=init_backend["data_backend"],
                 cache_data_backend=image_embed_data_backend["data_backend"],
-                instance_data_root=init_backend["instance_data_root"],
+                instance_data_dir=init_backend["instance_data_dir"],
                 delete_problematic_images=backend.get(
                     "delete_problematic_images", args.delete_problematic_images
                 ),
@@ -817,19 +916,29 @@ def configure_multi_databackend(
                     "minimum_image_size",
                     args.minimum_image_size,
                 ),
-                vae_batch_size=args.vae_batch_size,
-                write_batch_size=args.write_batch_size,
+                vae_batch_size=backend.get("vae_batch_size", args.vae_batch_size),
+                write_batch_size=backend.get("write_batch_size", args.write_batch_size),
+                read_batch_size=backend.get("read_batch_size", args.read_batch_size),
                 cache_dir=backend.get("cache_dir_vae", args.cache_dir_vae),
-                max_workers=backend.get("max_workers", 32),
-                process_queue_size=backend.get("process_queue_size", 64),
-                vae_cache_preprocess=args.vae_cache_preprocess,
+                max_workers=backend.get("max_workers", args.max_workers),
+                process_queue_size=backend.get(
+                    "image_processing_batch_size", args.image_processing_batch_size
+                ),
+                vae_cache_ondemand=args.vae_cache_ondemand,
+                hash_filenames=hash_filenames,
             )
 
-            if args.vae_cache_preprocess:
+            if not args.vae_cache_ondemand:
                 info_log(f"(id={init_backend['id']}) Discovering cache objects..")
                 if accelerator.is_local_main_process:
                     init_backend["vaecache"].discover_all_files()
                 accelerator.wait_for_everyone()
+            all_image_files = StateTracker.get_image_files(
+                data_backend_id=init_backend["id"]
+            )
+            init_backend["vaecache"].build_vae_cache_filename_map(
+                all_image_files=all_image_files
+            )
 
         if (
             (
@@ -857,17 +966,17 @@ def configure_multi_databackend(
         accelerator.wait_for_everyone()
 
         if (
-            args.vae_cache_preprocess
+            not args.vae_cache_ondemand
             and "vae" not in args.skip_file_discovery
             and "vae" not in backend.get("skip_file_discovery", "")
         ):
-            init_backend["vaecache"].split_cache_between_processes()
-            if args.vae_cache_preprocess:
+            init_backend["vaecache"].discover_unprocessed_files()
+            if not args.vae_cache_ondemand:
                 init_backend["vaecache"].process_buckets()
-            logger.debug(
-                f"Encoding images during training: {not args.vae_cache_preprocess}"
-            )
+            logger.debug(f"Encoding images during training: {args.vae_cache_ondemand}")
             accelerator.wait_for_everyone()
+
+        info_log(f"Configured backend: {init_backend}")
 
         StateTracker.register_data_backend(init_backend)
         init_backend["metadata_backend"].save_cache()
@@ -924,6 +1033,46 @@ def get_local_backend(
     )
 
 
+def get_csv_backend(
+    accelerator,
+    id: str,
+    csv_file: str,
+    csv_cache_dir: str,
+    compress_cache: bool = False,
+    shorten_filenames: bool = False,
+) -> CSVDataBackend:
+    from pathlib import Path
+
+    return CSVDataBackend(
+        accelerator=accelerator,
+        id=id,
+        csv_file=Path(csv_file),
+        image_cache_loc=csv_cache_dir,
+        compress_cache=compress_cache,
+        shorten_filenames=shorten_filenames,
+    )
+
+
+def check_csv_config(backend: dict, args) -> None:
+    required_keys = {
+        "csv_file": "This is the path to the CSV file containing your image URLs.",
+        "csv_cache_dir": "This is the path to your temporary cache files where images will be stored. This can grow quite large.",
+        "csv_caption_column": "This is the column in your csv which contains the caption(s) for the samples.",
+    }
+    for key in required_keys.keys():
+        if key not in backend:
+            raise ValueError(
+                f"Missing required key {key} in CSV backend config: {required_keys[key]}"
+            )
+    if not args.compress_disk_cache:
+        logger.warning(
+            "You can save more disk space for cache objects by providing --compress_disk_cache and recreating its contents"
+        )
+    caption_strategy = backend.get("caption_strategy")
+    if caption_strategy is None or caption_strategy != "csv":
+        raise ValueError("CSV backend requires a caption_strategy of 'csv'.")
+
+
 def check_aws_config(backend: dict) -> None:
     """
     Check the configuration for an AWS backend.
@@ -954,6 +1103,7 @@ def get_aws_backend(
     accelerator,
     identifier: str,
     compress_cache: bool = False,
+    max_pool_connections: int = 128,
 ) -> S3DataBackend:
     return S3DataBackend(
         id=identifier,
@@ -964,6 +1114,7 @@ def get_aws_backend(
         aws_access_key_id=aws_access_key_id,
         aws_secret_access_key=aws_secret_access_key,
         compress_cache=compress_cache,
+        max_pool_connections=max_pool_connections,
     )
 
 

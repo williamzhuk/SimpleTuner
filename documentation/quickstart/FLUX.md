@@ -1,6 +1,14 @@
-## Stable Diffusion 3
+## Flux[dev] / Flux[schnell] Quickstart
 
-In this example, we'll be training a Stable Diffusion 3 model using the SimpleTuner toolkit and will be using the `lora` model type.
+In this example, we'll be training a Flux.1 LoRA model using the SimpleTuner toolkit.
+
+### Hardware requirements
+
+When you're training every component of the model, a rank-16 LoRA ends up using a bit more than 40GB of VRAM for training.
+
+You'll need at minimum, a single A40 GPU, or, ideally, multiple A6000s. Luckily, these are readily available through providers such as TensorDock for extremely low rates (<$2/hr).
+
+**Unlike other models, AMD and Apple GPUs do not work for training Flux.**
 
 ### Prerequisites
 
@@ -15,7 +23,7 @@ python --version
 Clone the SimpleTuner repository and set up the python venv:
 
 ```bash
-git clone --branch=release https://github.com/bghira/SimpleTuner.git
+git clone --branch=main https://github.com/bghira/SimpleTuner.git
 
 cd SimpleTuner
 
@@ -25,6 +33,8 @@ source .venv/bin/activate
 
 pip install -U poetry pip
 ```
+
+**Note:** We're currently relying on the `main` branch here, but after the next release, we'll use the `release` branch instead.
 
 Depending on your system, you will run one of 3 commands:
 
@@ -37,6 +47,17 @@ poetry install --no-root
 
 # Linux with ROCM
 poetry install --no-root -C install/rocm
+```
+
+#### Custom Diffusers build
+
+For LoRA support in Diffusers, the current main branch does not yet have this merged in.
+
+To obtain the correct build, run the following commands:
+
+```bash
+pip uninstall diffusers
+pip install git+https://github.com/huggingface/diffusers@lora-support-flux
 ```
 
 ### Setting up the environment
@@ -54,21 +75,18 @@ cp config/config.env.example config/config.env
 There, you will need to modify the following variables:
 
 - `MODEL_TYPE` - Set this to `lora`.
-- `STABLE_DIFFUSION_3` - Set this to `true`.
-- `MODEL_NAME` - Set this to `stabilityai/stable-diffusion-3-medium-diffusers`. Note that you will need to log in to Huggingface and be granted access to download this model. We will go over logging in to Huggingface later in this tutorial.
+- `FLUX` - Set this to `true`.
+- `MODEL_NAME` - Set this to `black-forest-labs/FLUX.1-dev`.
+  - Note that you will *probably* need to log in to Huggingface and be granted access to download this model. We will go over logging in to Huggingface later in this tutorial.
 - `OUTPUT_DIR` - Set this to the directory where you want to store your outputs and datasets. It's recommended to use a full path here.
-- `VALIDATION_RESOLUTION` - As SD3 is a 1024px model, you can set this to `1024x1024`.
-  - Additionally, SD3 was fine-tuned on multi-aspect buckets, and other resolutions may be specified using commas to separate them: `1024x1024,1280x768`
-- `VALIDATION_GUIDANCE` - SD3 benefits from a very-low value. Set this to `3.0`.
-
-There are a few more if using a Mac M-series machine:
-
-- `MIXED_PRECISION` should be set to `no`.
-- `USE_XFORMERS` should be set to `false`.
+- `VALIDATION_RESOLUTION` - As Flux is a 1024px model, you can set this to `1024x1024`.
+  - Additionally, Flux was fine-tuned on multi-aspect buckets, and other resolutions may be specified using commas to separate them: `1024x1024,1280x768,2048x2048`
+- `VALIDATION_GUIDANCE` - Use whatever you are used to selecting at inference time for Flux.
+- `TRAINER_EXTRA_ARGS` - Here, you can place `--lora_rank=4` if you wish to substantially reduce the size of the LoRA being trained. This can help with VRAM use.
 
 #### Quantised model training
 
-Tested on Apple and NVIDIA systems, Hugging Face Optimum-Quanto can be used to reduce the precision and VRAM requirements well below the requirements of base SDXL training.
+Tested on Apple and NVIDIA systems, Hugging Face Optimum-Quanto can be used to reduce the precision and VRAM requirements, training Flux on just 20GB.
 
 Inside your SimpleTuner venv:
 
@@ -95,6 +113,7 @@ export TRAINER_EXTRA_ARGS="${TRAINER_EXTRA_ARGS} --text_encoder_1_precision=no_c
 export OPTIMIZER="adafactor" # or maybe prodigy
 ```
 
+
 #### Dataset considerations
 
 It's crucial to have a substantial dataset to train your model on. There are limitations on the dataset size, and you will need to ensure that your dataset is large enough to train your model effectively. Note that the bare minimum dataset size is `TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS` as well as more than `VAE_BATCH_SIZE`. The dataset will not be useable if it is too small.
@@ -106,7 +125,7 @@ In your `OUTPUT_DIR` directory, create a multidatabackend.json:
 ```json
 [
   {
-    "id": "pseudo-camera-10k-sd3",
+    "id": "pseudo-camera-10k-flux",
     "type": "local",
     "crop": true,
     "crop_aspect": "square",
@@ -116,7 +135,7 @@ In your `OUTPUT_DIR` directory, create a multidatabackend.json:
     "maximum_image_size": 1.0,
     "target_downsample_size": 1.0,
     "resolution_type": "area",
-    "cache_dir_vae": "cache/vae/sd3/pseudo-camera-10k",
+    "cache_dir_vae": "cache/vae/flux/pseudo-camera-10k",
     "instance_data_dir": "datasets/pseudo-camera-10k",
     "disabled": false,
     "skip_file_discovery": "",
@@ -128,7 +147,7 @@ In your `OUTPUT_DIR` directory, create a multidatabackend.json:
     "type": "local",
     "dataset_type": "text_embeds",
     "default": true,
-    "cache_dir": "cache/text/sd3/pseudo-camera-10k",
+    "cache_dir": "cache/text/flux/pseudo-camera-10k",
     "disabled": false,
     "write_batch_size": 128
   }
@@ -178,3 +197,29 @@ bash train.sh
 This will begin the text embed and VAE output caching to disk.
 
 For more information, see the [dataloader](/documentation/DATALOADER.md) and [tutorial](/TUTORIAL.md) documents.
+
+**Note:** It's unclear whether training on multi-aspect buckets works correctly for Flux at the moment. It's recommended to use `crop_style=random` and `crop_aspect=square`.
+
+## Notes & troubleshooting tips
+
+- A model as large as 12B has empirically performed better with lower learning rates.
+  - LoRA at 1e-4 might totally roast the thing. LoRA at 1e-7 does nearly nothing.
+- Minimum 8bit quantisation is required for a 24G card to train this model - but 32G (V100) cards suffer a more tragic fate.
+  - Without quantising the model, a rank-1 LoRA sits at just over 32GB of mem use, in a way that prevents a 32G V100 from actually working
+  - Adafactor works, reducing VRAM to ~24G or further with sub-1024x1024 training
+- Quantising the model isn't a bad thing
+  - It allows you to push higher batch sizes and possibly obtain a better result
+  - It unlocks the non-bf16 optimisers for use, such as Prodigy, Adafactor, Dadaptation, AdamW, and AdamW8Bit
+- As usual, **fp8 quantisation runs more slowly** than **int8** and might have a worse result due to the use of `e4m3fn` in Quanto
+  - fp16 training similarly is bad for Flux; this model wants the range of bf16
+  - `e5m2` level precision is better at fp8 but haven't looked into how to enable it yet. Sorry, H100 owners. We weep for you.
+- Larger rank models might be undesirable on a 12B model due to the general training dynamics of large models.
+  - Try a smaller network first (rank-1, rank-4) and work your way up - they'll train faster, and might do everything you need.
+- When you do these things (among others), some square grid artifacts **may** begin appearing in the samples:
+  - Overtrain with low quality data
+  - Use too high of a learning rate
+  - Select a bad optimiser
+  - Overtraining (in general), a low-capacity network with too many images
+  - Undertraining (also), a high-capacity network with too few images
+  - Using weird aspect ratios or training data sizes
+- Training for too long on square crops probably won't damage this model. Go nuts, it's great and reliable.

@@ -9,15 +9,15 @@
 - [Design Philosophy](#design-philosophy)
 - [Tutorial](#tutorial)
 - [Features](#features)
+  - [Flux](#flux1)
   - [PixArt Sigma](#pixart-sigma)
   - [Stable Diffusion 2.0/2.1](#stable-diffusion-20--21)
   - [Stable Diffusion 3.0](#stable-diffusion-3)
-  - [AuraFlow](#auraflow)
   - [Kwai Kolors](#kwai-kolors)
 - [Hardware Requirements](#hardware-requirements)
+  - [Flux](#flux1-dev-schnell)
   - [SDXL](#sdxl-1024px)
   - [Stable Diffusion (Legacy)](#stable-diffusion-2x-768px)
-  - [AuraFlow v0.1](#auraflow-v01)
 - [Scripts](#scripts)
 - [Toolkit](#toolkit)
 - [Setup](#setup)
@@ -46,8 +46,9 @@ For memory-constrained systems, see the [DeepSpeed document](/documentation/DEEP
 - Aspect bucketing: support for a variety of image sizes and aspect ratios, enabling widescreen and portrait training.
 - Refiner LoRA or full u-net training for SDXL
 - Most models are trainable on a 24G GPU, or even down to 16G at lower base resolutions.
-  - LoRA training for PixArt, SDXL, SD3, and SD 2.x that uses less than 16G VRAM; AuraFlow uses less than 24G VRAM
+  - LoRA training for PixArt, SDXL, SD3, and SD 2.x that uses less than 16G VRAM
 - DeepSpeed integration allowing for [training SDXL's full u-net on 12G of VRAM](/documentation/DEEPSPEED.md), albeit very slowly.
+- Quantised LoRA training, using low-precision base model or text encoder weights to reduce VRAM consumption while still allowing DreamBooth.
 - Optional EMA (Exponential moving average) weight network to counteract model overfitting and improve training stability. **Note:** This does not apply to LoRA.
 - Train directly from an S3-compatible storage provider, eliminating the requirement for expensive local storage. (Tested with Cloudflare R2 and Wasabi S3)
 - For only SDXL and SD 1.x/2.x, full [ControlNet model training](/documentation/CONTROLNET.md) (not ControlLoRA or ControlLite)
@@ -55,6 +56,17 @@ For memory-constrained systems, see the [DeepSpeed document](/documentation/DEEP
 - Webhook support for updating eg. Discord channels with your training progress, validations, and errors
 - Integration with the [Hugging Face Hub](https://huggingface.co) for seamless model upload and nice automatically-generated model cards.
 
+### Flux.1
+
+Preliminary training support for Flux.1 is included:
+
+- Low loss training using SD3 style loss calculations
+- LoRA or full tuning via DeepSpeed ZeRO
+- ControlNet training is not yet supported
+- Train either Schnell or Dev models
+- Quantise the base model using `--base_model_precision` to `int8-quanto` or `fp8-quanto` for major memory savings
+
+See [hardware requirements](#flux1-dev-schnell).
 
 ### PixArt Sigma
 
@@ -85,14 +97,6 @@ Stable Diffusion 2.1 is known for difficulty during fine-tuning, but this doesn'
 
 See the [Stable Diffusion 3 Quickstart](/documentation/quickstart/SD3.md) to get going.
 
-### AuraFlow
-
-AuraFlow is a novel, open-source implementation of a flow-matching text-to-image model using a simplified architecture compared to SD3, with a greater number of parameters.
-
-Currently, AuraFlow v0.1 has limited support for SimpleTuner:
-- All limitations that apply to Stable Diffusion 3 also apply to AuraFlow
-- LoRA is currently the only viable method of AuraFlow training
-
 ### Hunyian-DiT
 
 _Placeholder text._
@@ -118,6 +122,15 @@ Without EMA, more care must be taken not to drastically change the model leading
 - Apple - LoRA and full u-net tuning are tested to work on an M3 Max with 128G memory, taking about **12G** of "Wired" memory and **4G** of system memory for SDXL.
   - You likely need a 24G or greater machine for machine learning with M-series hardware due to the lack of memory-efficient attention.
 
+### Flux.1 [dev, schnell]
+
+- A100-40G (LoRA, rank-16 or lower)
+- A100-80G (LoRA, up to rank-256)
+- 3x A100-80G (Full tuning, DeepSpeed ZeRO 1)
+- 1x A100-80G (Full tuning, DeepSpeed ZeRO 3)
+
+Flux prefers being trained with multiple GPUs.
+
 ### SDXL, 1024px
 
 - A100-80G (EMA, large batches, LoRA @ insane batch sizes)
@@ -131,14 +144,6 @@ Without EMA, more care must be taken not to drastically change the model leading
 - A100-40, A40, A6000 or better (EMA, 1024px training)
 - NVIDIA RTX 4090 or better (24G, no EMA)
 - NVIDIA RTX 4080 or better (LoRA only)
-
-### AuraFlow v0.1
-
-This model is very large; it will require more resources to train than any other, incurring a substantial hardware cost.
-
-- Full tuning will OOM at a batch size of 1 on a single 80G GPU. A system with 8x A100-80G (SXM4) is a recommended minimum for FSDP (DeepSpeed ZeRO Stage 2) training.
-- LoRA training will OOM at a batch size of 1 on a single 16G GPU. A system with 1x 24G is required, with a 48G GPU being an ideal size.
-
 
 ## Scripts
 

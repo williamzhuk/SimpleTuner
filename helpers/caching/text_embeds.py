@@ -13,10 +13,13 @@ from queue import Queue
 import queue
 from threading import Thread
 from concurrent.futures import ThreadPoolExecutor
-from helpers.training.multi_process import _get_rank as get_rank
+from helpers.training.multi_process import _get_rank as get_rank, should_log
 
 logger = logging.getLogger("TextEmbeddingCache")
-logger.setLevel(os.environ.get("SIMPLETUNER_LOG_LEVEL", "INFO"))
+if should_log():
+    logger.setLevel(os.environ.get("SIMPLETUNER_LOG_LEVEL", "INFO"))
+else:
+    logger.setLevel("ERROR")
 
 
 def _encode_sd3_prompt_with_t5(
@@ -123,6 +126,19 @@ class TextEmbeddingCache:
         self.accelerator = accelerator
         self.cache_dir = cache_dir
         self.model_type = model_type
+        self.pipeline = None
+        if self.model_type == "flux":
+            from diffusers.pipelines.flux import FluxPipeline
+
+            self.pipeline = FluxPipeline.from_pretrained(
+                pretrained_model_name_or_path=StateTracker.get_args().pretrained_model_name_or_path,
+                text_encoder=text_encoders[0],
+                text_encoder_2=text_encoders[1],
+                tokenizer=tokenizers[0],
+                tokenizer_2=tokenizers[1],
+                transformer=None,
+                vae=None,
+            )
         self.prompt_handler = prompt_handler
         self.write_batch_size = write_batch_size
         self.read_batch_size = read_batch_size
@@ -177,7 +193,7 @@ class TextEmbeddingCache:
             StateTracker.get_text_cache_files(data_backend_id=self.id)
             or StateTracker.set_text_cache_files(
                 self.data_backend.list_files(
-                    instance_data_root=self.cache_dir,
+                    instance_data_dir=self.cache_dir,
                     str_pattern="*.pt",
                 ),
                 data_backend_id=self.id,
@@ -232,6 +248,36 @@ class TextEmbeddingCache:
     def load_from_cache(self, filename):
         result = self.data_backend.torch_load(filename)
         return result
+
+    def encode_flux_prompt(
+        self,
+        text_encoders,
+        tokenizers,
+        prompt: str,
+        is_validation: bool = False,
+        return_masked_embed: bool = True,
+    ):
+        """
+        Encode a prompt for a Flux model.
+
+        Args:
+            text_encoders: List of text encoders.
+            tokenizers: List of tokenizers.
+            prompt: The prompt to encode.
+            num_images_per_prompt: The number of images to generate per prompt.
+            is_validation: Whether the prompt is for validation. No-op for SD3.
+
+        Returns:
+            Tuple of (prompt_embeds, pooled_prompt_embeds).
+        """
+        prompt_embeds, pooled_prompt_embeds, time_ids = self.pipeline.encode_prompt(
+            prompt=prompt,
+            prompt_2=prompt,
+            device=self.accelerator.device,
+            max_sequence_length=StateTracker.get_args().tokenizer_max_length,
+        )
+
+        return prompt_embeds, pooled_prompt_embeds, time_ids
 
     # Adapted from pipelines.StableDiffusion3Pipeline.encode_prompt
     def encode_sd3_prompt(
@@ -469,9 +515,7 @@ class TextEmbeddingCache:
 
         return text_inputs
 
-    def encode_t5_prompt(
-        self, input_ids, attention_mask, apply_attn_mask: bool = False
-    ):
+    def encode_t5_prompt(self, input_ids, attention_mask):
         text_input_ids = input_ids.to(self.text_encoders[0].device)
         attention_mask = attention_mask.to(self.text_encoders[0].device)
         prompt_embeds = self.text_encoders[0](
@@ -479,34 +523,26 @@ class TextEmbeddingCache:
             attention_mask=attention_mask,
             return_dict=False,
         )[0]
-        if apply_attn_mask:
-            # then we'll mangle the attention mask to be a bit more useful.
-            prompt_attention_mask = attention_mask.unsqueeze(-1).expand(
-                prompt_embeds.shape
-            )
-            prompt_embeds = prompt_embeds * prompt_attention_mask
         prompt_embeds = prompt_embeds.to("cpu")
 
         return prompt_embeds
 
-    def compute_t5_prompt(self, prompt: str, apply_attn_mask: bool = False):
+    def compute_t5_prompt(self, prompt: str):
         """
         Tokenise, encode, optionally mask, and then return a prompt_embed for a T5 model.
 
         Args:
             prompt: The prompt to encode.
-            apply_attn_mask: Whether to apply the attention mask to the embeddings. This is required for AuraFlow, and might also improve disk space efficiency.
         Returns:
             Tuple of (prompt_embeds, attention_mask)
         """
-        logger.debug(f"Computing deepfloyd prompt for: {prompt}")
+        logger.debug(f"Computing T5 caption for: {prompt}")
         text_inputs = self.tokenize_t5_prompt(
             prompt, tokenizer_max_length=StateTracker.get_args().tokenizer_max_length
         )
         result = self.encode_t5_prompt(
             text_inputs.input_ids,
             text_inputs.attention_mask,
-            apply_attn_mask=apply_attn_mask,
         )
         attn_mask = text_inputs.attention_mask
         del text_inputs
@@ -572,7 +608,7 @@ class TextEmbeddingCache:
         elif (
             self.model_type == "legacy"
             or self.model_type == "pixart_sigma"
-            or self.model_type == "aura_flow"
+            or self.model_type == "smoldit"
         ):
             # both sd1.x/2.x and t5 style models like pixart use this flow.
             output = self.compute_embeddings_for_legacy_prompts(
@@ -582,6 +618,12 @@ class TextEmbeddingCache:
             )
         elif self.model_type == "sd3":
             output = self.compute_embeddings_for_sd3_prompts(
+                raw_prompts,
+                return_concat=return_concat,
+                load_from_cache=load_from_cache,
+            )
+        elif self.model_type == "flux":
+            output = self.compute_embeddings_for_flux_prompts(
                 raw_prompts,
                 return_concat=return_concat,
                 load_from_cache=load_from_cache,
@@ -637,13 +679,7 @@ class TextEmbeddingCache:
             ncols=125,
             disable=return_concat,
             total=len(local_caption_split),
-            position=get_rank()
-            + (
-                self.accelerator.num_processes
-                if self.accelerator.num_processes > 1
-                else 2
-            )
-            + 1,
+            position=get_rank(),
         )
         with torch.no_grad():
             for prompt in tqdm(
@@ -652,7 +688,7 @@ class TextEmbeddingCache:
                 disable=return_concat,
                 leave=False,
                 ncols=125,
-                position=get_rank(),
+                position=get_rank() + self.accelerator.num_processes + 1,
             ):
                 filename = os.path.join(self.cache_dir, self.hash_prompt(prompt))
                 debug_msg = f"Processing file: {filename}, prompt: {prompt}"
@@ -774,7 +810,7 @@ class TextEmbeddingCache:
             ncols=125,
             disable=return_concat,
             total=len(local_caption_split),
-            position=0,
+            position=get_rank(),
         )
         with torch.no_grad():
             attention_mask = None
@@ -833,18 +869,15 @@ class TextEmbeddingCache:
                     if (
                         "deepfloyd" in StateTracker.get_args().model_type
                         or self.model_type == "pixart_sigma"
-                        or self.model_type == "aura_flow"
+                        or self.model_type == "smoldit"
                     ):
                         # TODO: Batch this
                         prompt_embeds, attention_mask = self.compute_t5_prompt(
                             prompt=prompt,
-                            apply_attn_mask=(
-                                True if self.model_type == "aura_flow" else False
-                            ),
                         )
                         if "deepfloyd" not in StateTracker.get_args().model_type:
                             # we have to store the attn mask with the embed for pixart.
-                            # aura doesn't require it, but it's just easier to keep.
+                            # smoldit requires the attn mask at inference time 💪🏽
                             prompt_embeds = (prompt_embeds, attention_mask)
                     else:
                         prompt_embeds = self.encode_legacy_prompt(
@@ -891,6 +924,143 @@ class TextEmbeddingCache:
             return prompt_embeds_all, attention_masks_all
         return prompt_embeds_all
 
+    def compute_embeddings_for_flux_prompts(
+        self,
+        prompts: list = None,
+        return_concat: bool = True,
+        is_validation: bool = False,
+        load_from_cache: bool = True,
+    ):
+        prompt_embeds_all = []
+        add_text_embeds_all = []
+        time_ids_all = []
+        should_encode = not load_from_cache
+        args = StateTracker.get_args()
+        if should_encode:
+            local_caption_split = self.split_captions_between_processes(
+                prompts or self.prompts
+            )
+        else:
+            local_caption_split = prompts or self.prompts
+        if (
+            hasattr(args, "cache_clear_validation_prompts")
+            and args.cache_clear_validation_prompts
+            and is_validation
+        ):
+            # If --cache_clear_validation_prompts was provided, we will forcibly overwrite them.
+            load_from_cache = False
+            should_encode = True
+        self.write_thread_bar = tqdm(
+            desc="Write embeds to disk",
+            leave=False,
+            ncols=125,
+            disable=return_concat,
+            total=len(local_caption_split),
+            position=get_rank(),
+        )
+        with torch.no_grad():
+            for prompt in tqdm(
+                local_caption_split,
+                desc="Processing prompts",
+                disable=return_concat,
+                leave=False,
+                ncols=125,
+                position=get_rank() + self.accelerator.num_processes + 1,
+            ):
+                filename = os.path.join(self.cache_dir, self.hash_prompt(prompt))
+                debug_msg = f"Processing file: {filename}, prompt: {prompt}"
+                prompt = PromptHandler.filter_caption(self.data_backend, prompt)
+                debug_msg = f"{debug_msg}\n -> filtered prompt: {prompt}"
+                if prompt is None:
+                    logger.error(f"Filename {filename} does not have a caption.")
+                    continue
+                logger.debug(debug_msg)
+                if return_concat and load_from_cache:
+                    try:
+                        # We attempt to load.
+                        prompt_embeds, add_text_embeds, time_ids = self.load_from_cache(
+                            filename
+                        )
+                        logger.debug(
+                            f"Cached Flux text embeds: {prompt_embeds.shape}, {add_text_embeds.shape}, {time_ids.shape}"
+                        )
+                    except Exception as e:
+                        # We failed to load. Now encode the prompt.
+                        logger.error(
+                            f"Failed retrieving prompt from cache:"
+                            f"\n-> prompt: {prompt}"
+                            f"\n-> filename: {filename}"
+                            f"\n-> error: {e}"
+                            f"\n-> id: {self.id}, data_backend id: {self.data_backend.id}"
+                        )
+                        should_encode = True
+                        raise Exception(
+                            "Cache retrieval for text embed file failed. Ensure your dataloader config value for skip_file_discovery does not contain 'text', and that preserve_data_backend_cache is disabled or unset."
+                        )
+                if should_encode:
+                    # If load_from_cache is True, should_encode would be False unless we failed to load.
+                    self.debug_log(f"Encoding prompt: {prompt}")
+                    prompt_embeds, pooled_prompt_embeds, time_ids = (
+                        self.encode_flux_prompt(
+                            self.text_encoders,
+                            self.tokenizers,
+                            [prompt],
+                            is_validation,
+                        )
+                    )
+                    logger.debug(
+                        f"Flux prompt embeds: {prompt_embeds.shape}, {pooled_prompt_embeds.shape}, {time_ids.shape}"
+                    )
+                    add_text_embeds = pooled_prompt_embeds
+                    current_size = self.write_queue.qsize()
+                    if current_size >= 2048:
+                        log_msg = str(
+                            f"[WARNING] Write queue size is {current_size}. This is quite large."
+                            " Consider increasing the write batch size. Delaying encode so that writes can catch up."
+                        )
+                        self.write_thread_bar.write(log_msg)
+                        while self.write_queue.qsize() > 100:
+                            time.sleep(0.1)
+
+                    self.debug_log(f"Adding embed to write queue: {filename}")
+                    self.save_to_cache(
+                        filename, (prompt_embeds, add_text_embeds, time_ids)
+                    )
+                    if return_concat:
+                        prompt_embeds = prompt_embeds.to(self.accelerator.device)
+                        add_text_embeds = add_text_embeds.to(self.accelerator.device)
+                        time_ids = time_ids.to(self.accelerator.device)
+                    else:
+                        del prompt_embeds
+                        del add_text_embeds
+                        del pooled_prompt_embeds
+                        continue
+
+                if return_concat:
+                    prompt_embeds_all.append(prompt_embeds)
+                    add_text_embeds_all.append(add_text_embeds)
+                    time_ids_all.append(time_ids)
+
+            while self.write_queue.qsize() > 0:
+                time.sleep(0.1)  # Sleep briefly to avoid busy-waiting
+
+            # Close the tqdm progress bar after the loop
+            self.write_thread_bar.close()
+            self.process_write_batches = False
+
+            if not return_concat:
+                del prompt_embeds_all
+                del add_text_embeds_all
+                del time_ids_all
+                return
+
+            logger.debug(f"Returning all prompt embeds: {prompt_embeds_all}")
+            prompt_embeds_all = torch.cat(prompt_embeds_all, dim=0)
+            add_text_embeds_all = torch.cat(add_text_embeds_all, dim=0)
+            time_ids_all = torch.cat(time_ids_all, dim=0)
+
+        return prompt_embeds_all, add_text_embeds_all, time_ids_all
+
     def compute_embeddings_for_sd3_prompts(
         self,
         prompts: list = None,
@@ -925,7 +1095,7 @@ class TextEmbeddingCache:
             ncols=125,
             disable=return_concat,
             total=len(local_caption_split),
-            position=get_rank() + self.accelerator.num_processes,
+            position=get_rank(),
         )
         with torch.no_grad():
             for prompt in tqdm(
@@ -934,7 +1104,7 @@ class TextEmbeddingCache:
                 disable=return_concat,
                 leave=False,
                 ncols=125,
-                position=get_rank(),
+                position=get_rank() + self.accelerator.num_processes + 1,
             ):
                 filename = os.path.join(self.cache_dir, self.hash_prompt(prompt))
                 debug_msg = f"Processing file: {filename}, prompt: {prompt}"
@@ -1024,11 +1194,6 @@ class TextEmbeddingCache:
             add_text_embeds_all = torch.cat(add_text_embeds_all, dim=0)
 
         return prompt_embeds_all, add_text_embeds_all
-
-    def split_cache_between_processes(self, prompts: list):
-        # Use the accelerator to split the data
-        with self.accelerator.split_between_processes(prompts) as split_files:
-            self.prompts = split_files
 
     def __del__(self):
         """Ensure that the batch write thread is properly closed."""

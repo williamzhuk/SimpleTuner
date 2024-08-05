@@ -3,6 +3,7 @@ from helpers.data_backend.base import BaseDataBackend
 from helpers.metadata.backends.base import MetadataBackend
 from helpers.image_manipulation.training_sample import TrainingSample
 from helpers.image_manipulation.load import load_image
+from helpers.training.multi_process import should_log
 import json
 import logging
 import os
@@ -11,7 +12,10 @@ from io import BytesIO
 from helpers.image_manipulation.brightness import calculate_luminance
 
 logger = logging.getLogger("JsonMetadataBackend")
-target_level = os.environ.get("SIMPLETUNER_LOG_LEVEL", "INFO")
+if should_log():
+    target_level = os.environ.get("SIMPLETUNER_LOG_LEVEL", "INFO")
+else:
+    target_level = "ERROR"
 logger.setLevel(target_level)
 
 
@@ -19,7 +23,7 @@ class JsonMetadataBackend(MetadataBackend):
     def __init__(
         self,
         id: str,
-        instance_data_root: str,
+        instance_data_dir: str,
         cache_file: str,
         metadata_file: str,
         data_backend: BaseDataBackend,
@@ -35,7 +39,7 @@ class JsonMetadataBackend(MetadataBackend):
     ):
         super().__init__(
             id=id,
-            instance_data_root=instance_data_root,
+            instance_data_dir=instance_data_dir,
             cache_file=cache_file,
             metadata_file=metadata_file,
             data_backend=data_backend,
@@ -83,7 +87,7 @@ class JsonMetadataBackend(MetadataBackend):
         if all_image_files is None:
             logger.debug("No image file cache available, retrieving fresh")
             all_image_files = self.data_backend.list_files(
-                instance_data_root=self.instance_data_root,
+                instance_data_dir=self.instance_data_dir,
                 str_pattern="*.[jJpP][pPnN][gG]",
             )
             all_image_files = StateTracker.set_image_files(

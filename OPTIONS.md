@@ -13,6 +13,11 @@ This guide provides a user-friendly breakdown of the command-line options availa
 - **What**: Choices: lora, full, deepfloyd, deepfloyd-lora, deepfloyd-stage2, deepfloyd-stage2-lora. Default: lora
 - **Why**: Select whether a LoRA or full fine-tune are created. LoRA only supported for SDXL.
 
+## `--flux`
+
+- **What**: Enable Flux training style.
+- **Why**: Flux is an enormous model and uses flow-matching. We must take careful considerations when handling its text embeds and validations.
+
 ### `--sd3`
 
 - **What**: Enable Stable Diffusion 3 training quirks/overrides.
@@ -22,11 +27,6 @@ This guide provides a user-friendly breakdown of the command-line options availa
 
 - **What**: Enable PixArt Sigma training quirks/overrides.
 - **Why**: PixArt is similar to SD3 and DeepFloyd in one way or another, and needs special treatment at validation, training, and inference time. Use this option to enable PixArt training support. PixArt does not support ControlNet, LoRA, or `--validation_using_datasets`
-
-### `--aura_flow`
-
-- **What**: Enable AuraFlow training quirks/overrides.
-- **Why**: As a flow-matching model, AuraFlow has several unique needs. This option must be enabled to load and train an AuraFlow model.
 
 ### `--pretrained_model_name_or_path`
 
@@ -241,12 +241,9 @@ This is a basic overview meant to help you get started. For a complete list of o
 usage: train.py [-h] [--snr_gamma SNR_GAMMA] [--use_soft_min_snr]
                 [--soft_min_snr_sigma_data SOFT_MIN_SNR_SIGMA_DATA]
                 [--model_type {full,lora,deepfloyd-full,deepfloyd-lora,deepfloyd-stage2,deepfloyd-stage2-lora}]
-                [--legacy] [--kolors] [--aura_flow]
+                [--legacy] [--kolors] [--flux] [--smoldit]
+                [--smoldit_config {smoldit-small,smoldit-swiglu,smoldit-base,smoldit-large,smoldit-huge}]
                 [--flow_matching_loss {diffusers,compatible,diffusion}]
-                [--aura_flow_target {any,dit,mmdit}]
-                [--aura_flow_freeze_direction {up,down}]
-                [--aura_flow_first_unfrozen_dit_layer AURA_FLOW_FIRST_UNFROZEN_DIT_LAYER]
-                [--aura_flow_first_unfrozen_mmdit_layer AURA_FLOW_FIRST_UNFROZEN_MMDIT_LAYER]
                 [--pixart_sigma] [--sd3]
                 [--sd3_t5_mask_behaviour {do-nothing,mask}]
                 [--weighting_scheme {sigma_sqrt,logit_normal,mode,none}]
@@ -275,15 +272,19 @@ usage: train.py [-h] [--snr_gamma SNR_GAMMA] [--use_soft_min_snr]
                 [--vae_dtype {default,fp16,fp32,bf16}]
                 [--vae_batch_size VAE_BATCH_SIZE]
                 [--vae_cache_scan_behaviour {recreate,sync}]
-                [--vae_cache_preprocess] [--compress_disk_cache]
-                [--aspect_bucket_disable_rebuild] [--keep_vae_loaded]
+                [--vae_cache_preprocess] [--vae_cache_ondemand]
+                [--compress_disk_cache] [--aspect_bucket_disable_rebuild]
+                [--keep_vae_loaded]
                 [--skip_file_discovery SKIP_FILE_DISCOVERY]
                 [--revision REVISION] [--variant VARIANT]
                 [--preserve_data_backend_cache] [--use_dora]
                 [--override_dataset_config] [--cache_dir_text CACHE_DIR_TEXT]
                 [--cache_dir_vae CACHE_DIR_VAE] --data_backend_config
                 DATA_BACKEND_CONFIG [--write_batch_size WRITE_BATCH_SIZE]
-                [--enable_multiprocessing]
+                [--read_batch_size READ_BATCH_SIZE]
+                [--image_processing_batch_size IMAGE_PROCESSING_BATCH_SIZE]
+                [--enable_multiprocessing] [--max_workers MAX_WORKERS]
+                [--aws_max_pool_connections AWS_MAX_POOL_CONNECTIONS]
                 [--torch_num_threads TORCH_NUM_THREADS]
                 [--dataloader_prefetch]
                 [--dataloader_prefetch_qlen DATALOADER_PREFETCH_QLEN]
@@ -356,6 +357,10 @@ usage: train.py [-h] [--snr_gamma SNR_GAMMA] [--use_soft_min_snr]
                 [--validation_disable_unconditional] [--disable_compel]
                 [--enable_watermark] [--mixed_precision {bf16,no}]
                 [--gradient_precision {unmodified,fp32}]
+                [--base_model_precision {no_change,fp4-bnb,fp8-bnb,fp8-quanto,int8-quanto,int4-quanto,int2-quanto}]
+                [--text_encoder_1_precision {no_change,fp4-bnb,fp8-bnb,fp8-quanto,int8-quanto,int4-quanto,int2-quanto}]
+                [--text_encoder_2_precision {no_change,fp4-bnb,fp8-bnb,fp8-quanto,int8-quanto,int4-quanto,int2-quanto}]
+                [--text_encoder_3_precision {no_change,fp4-bnb,fp8-bnb,fp8-quanto,int8-quanto,int4-quanto,int2-quanto}]
                 [--local_rank LOCAL_RANK]
                 [--enable_xformers_memory_efficient_attention]
                 [--set_grads_to_none] [--noise_offset NOISE_OFFSET]
@@ -405,38 +410,20 @@ options:
                         Diffusion 1.x or 2.x model.
   --kolors              This option must be provided when training a Kolors
                         model.
-  --aura_flow           This must be set when training an AuraFlow model.
+  --flux                This option must be provided when training a Flux
+                        model.
+  --smoldit             Use the experimental SmolDiT model architecture.
+  --smoldit_config {smoldit-small,smoldit-swiglu,smoldit-base,smoldit-large,smoldit-huge}
+                        The SmolDiT configuration to use. This is a list of
+                        pre-configured models. The default is 'smoldit-base'.
   --flow_matching_loss {diffusers,compatible,diffusion}
                         A discrepancy exists between the Diffusers
                         implementation of flow matching and the minimal
-                        implementations provided by StabilityAI and AuraFlow.
-                        This experimental option allows switching loss
-                        calculations to be compatible with those.
-                        Additionally, 'diffusion' is offered as an option to
-                        reparameterise a model to v_prediction loss.
-  --aura_flow_target {any,dit,mmdit}
-                        Aura Diffusion contains joint attention MM-DiT blocks
-                        as well as standard DiT. When training a LoRA, we can
-                        limit the blocks trained. The default option 'all'
-                        means all blocks will be trained. 'dit' will train
-                        only the standard DiT blocks, and 'mmdit' will train
-                        only the MM-DiT blocks. Experimentation will likely
-                        prove fruitful, as these LoRAs train quickly. The
-                        default is 'all'.
-  --aura_flow_freeze_direction {up,down}
-                        When freezing the AuraFlow model, you can freeze it
-                        'up' from the bottom, or 'down' from the top. The
-                        default value is 'up' which will freeze the model from
-                        layer 11 to 31 by default.
-  --aura_flow_first_unfrozen_dit_layer AURA_FLOW_FIRST_UNFROZEN_DIT_LAYER
-                        Due to the size of the AuraFlow model, by default only
-                        the 20th layer and up will be trained. More layers can
-                        be excluded to speed up training or reduce VRAM
-                        consumption further.
-  --aura_flow_first_unfrozen_mmdit_layer AURA_FLOW_FIRST_UNFROZEN_MMDIT_LAYER
-                        By default, AuraFlow's MM-DiT blocks are not trained
-                        as they are very large and training them is
-                        unnecessary for finetuning.
+                        implementation provided by StabilityAI. This
+                        experimental option allows switching loss calculations
+                        to be compatible with those. Additionally, 'diffusion'
+                        is offered as an option to reparameterise a model to
+                        v_prediction loss.
   --pixart_sigma        This must be set when training a PixArt Sigma model.
   --sd3                 This option must be provided when training a Stable
                         Diffusion 3 model.
@@ -624,10 +611,11 @@ options:
                         to use the default value and allow the cache to be
                         recreated.
   --vae_cache_preprocess
-                        By default, will encode images during training. For
-                        some situations, pre-processing may be desired. To
-                        revert to the old behaviour, supply
-                        --vae_cache_preprocess=false.
+                        This option is deprecated and will be removed in a
+                        future release. Use --vae_cache_ondemand instead.
+  --vae_cache_ondemand  By default, will batch-encode images before training.
+                        For some situations, ondemand may be desired, but it
+                        greatly slows training and increases memory pressure.
   --compress_disk_cache
                         If set, will gzip-compress the disk cache for Pytorch
                         files. This will save substantial disk space, but may
@@ -702,12 +690,28 @@ options:
                         objects are written. This mostly applies to S3, but
                         some shared server filesystems may benefit as well,
                         eg. Ceph. Default: 64.
+  --read_batch_size READ_BATCH_SIZE
+                        Used by the VAE cache to prefetch image data. This is
+                        the number of images to read ahead.
+  --image_processing_batch_size IMAGE_PROCESSING_BATCH_SIZE
+                        When resizing and cropping images, we do it in
+                        parallel using processes or threads. This defines how
+                        many images will be read into the queue before they
+                        are processed.
   --enable_multiprocessing
                         If set, will use processes instead of threads during
                         metadata caching operations. For some systems,
                         multiprocessing may be faster than threading, but will
                         consume a lot more memory. Use this option with
                         caution, and monitor your system's memory usage.
+  --max_workers MAX_WORKERS
+                        How many active threads or processes to run during VAE
+                        caching.
+  --aws_max_pool_connections AWS_MAX_POOL_CONNECTIONS
+                        When using AWS backends, the maximum number of
+                        connections to keep open to the S3 bucket at a single
+                        time. This should be greater or equal to the
+                        max_workers and aspect bucket worker count values.
   --torch_num_threads TORCH_NUM_THREADS
                         The number of threads to use for PyTorch operations.
                         This is not the same as the number of workers.
@@ -1097,6 +1101,38 @@ options:
                         accumulation steps are enabled is now to use fp32
                         gradients, which is slower, but provides more accurate
                         updates.
+  --base_model_precision {no_change,fp4-bnb,fp8-bnb,fp8-quanto,int8-quanto,int4-quanto,int2-quanto}
+                        When training a LoRA, you might want to quantise the
+                        base model to a lower precision to save more VRAM. The
+                        default value, 'no_change', does not quantise any
+                        weights. Using 'fp4-bnb' or 'fp8-bnb' will require
+                        Bits n Bytes for quantisation (NVIDIA, maybe AMD).
+                        Using 'fp8-quanto' will require Quanto for
+                        quantisation (Apple Silicon, NVIDIA, AMD).
+  --text_encoder_1_precision {no_change,fp4-bnb,fp8-bnb,fp8-quanto,int8-quanto,int4-quanto,int2-quanto}
+                        When training a LoRA, you might want to quantise text
+                        encoder 1 to a lower precision to save more VRAM. The
+                        default value is to follow base_model_precision
+                        (no_change). Using 'fp4-bnb' or 'fp8-bnb' will require
+                        Bits n Bytes for quantisation (NVIDIA, maybe AMD).
+                        Using 'fp8-quanto' will require Quanto for
+                        quantisation (Apple Silicon, NVIDIA, AMD).
+  --text_encoder_2_precision {no_change,fp4-bnb,fp8-bnb,fp8-quanto,int8-quanto,int4-quanto,int2-quanto}
+                        When training a LoRA, you might want to quantise text
+                        encoder 2 to a lower precision to save more VRAM. The
+                        default value is to follow base_model_precision
+                        (no_change). Using 'fp4-bnb' or 'fp8-bnb' will require
+                        Bits n Bytes for quantisation (NVIDIA, maybe AMD).
+                        Using 'fp8-quanto' will require Quanto for
+                        quantisation (Apple Silicon, NVIDIA, AMD).
+  --text_encoder_3_precision {no_change,fp4-bnb,fp8-bnb,fp8-quanto,int8-quanto,int4-quanto,int2-quanto}
+                        When training a LoRA, you might want to quantise text
+                        encoder 3 to a lower precision to save more VRAM. The
+                        default value is to follow base_model_precision
+                        (no_change). Using 'fp4-bnb' or 'fp8-bnb' will require
+                        Bits n Bytes for quantisation (NVIDIA, maybe AMD).
+                        Using 'fp8-quanto' will require Quanto for
+                        quantisation (Apple Silicon, NVIDIA, AMD).
   --local_rank LOCAL_RANK
                         For distributed training: local_rank
   --enable_xformers_memory_efficient_attention

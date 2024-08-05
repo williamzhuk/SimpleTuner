@@ -6,6 +6,7 @@ import torch
 from helpers.data_backend.base import BaseDataBackend
 from helpers.multiaspect.image import MultiaspectImage
 from helpers.training.state_tracker import StateTracker
+from helpers.training.multi_process import should_log
 from multiprocessing import Process, Queue
 from threading import Thread
 from pathlib import Path
@@ -18,14 +19,17 @@ import numpy as np
 from threading import Semaphore
 
 logger = logging.getLogger("BaseMetadataBackend")
-logger.setLevel(os.environ.get("SIMPLETUNER_LOG_LEVEL", "INFO"))
+if should_log():
+    logger.setLevel(os.environ.get("SIMPLETUNER_LOG_LEVEL", "INFO"))
+else:
+    logger.setLevel("ERROR")
 
 
 class MetadataBackend:
     def __init__(
         self,
         id: str,
-        instance_data_root: str,
+        instance_data_dir: str,
         cache_file: str,
         metadata_file: str,
         data_backend: BaseDataBackend,
@@ -47,7 +51,7 @@ class MetadataBackend:
         self.accelerator = accelerator
         self.data_backend = data_backend
         self.batch_size = batch_size
-        self.instance_data_root = instance_data_root
+        self.instance_data_dir = instance_data_dir
         if cache_file_suffix is not None:
             cache_file = f"{cache_file}_{cache_file_suffix}"
             metadata_file = f"{metadata_file}_{cache_file_suffix}"
@@ -324,7 +328,7 @@ class MetadataBackend:
             num_batches = len(images) // effective_batch_size
             trimmed_images = images[: num_batches * effective_batch_size]
             logger.debug(f"Trimmed from {len(images)} to {len(trimmed_images)}")
-            if len(trimmed_images) == 0:
+            if len(trimmed_images) == 0 and should_log():
                 logger.error(
                     f"Bucket {bucket} has no images after trimming because {len(images)} images are not enough to satisfy an effective batch size of {effective_batch_size}."
                     " Lower your batch size, increase repeat count, or increase data pool size."
@@ -685,6 +689,7 @@ class MetadataBackend:
                     if result is not None:
                         return result
             return None
+
         return self.image_metadata.get(filepath, None)
 
     def scan_for_metadata(self):
@@ -888,12 +893,8 @@ class MetadataBackend:
 
         # Extract the base filename without the extension
         base_filename = os.path.splitext(os.path.basename(cache_file))[0]
-        base_filename_png = os.path.join(
-            self.instance_data_root, f"{base_filename}.png"
-        )
-        base_filename_jpg = os.path.join(
-            self.instance_data_root, f"{base_filename}.jpg"
-        )
+        base_filename_png = os.path.join(self.instance_data_dir, f"{base_filename}.png")
+        base_filename_jpg = os.path.join(self.instance_data_dir, f"{base_filename}.jpg")
         # Check if the base filename is in the correct bucket
         if any(
             base_filename_png in self.aspect_ratio_bucket_indices.get(bucket, set())

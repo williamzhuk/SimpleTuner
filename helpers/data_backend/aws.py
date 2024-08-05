@@ -11,6 +11,7 @@ from torch import Tensor
 import concurrent.futures
 from botocore.config import Config
 from helpers.data_backend.base import BaseDataBackend
+from helpers.training.multi_process import _get_rank as get_rank
 from helpers.image_manipulation.load import load_image
 from io import BytesIO
 
@@ -59,6 +60,7 @@ class S3DataBackend(BaseDataBackend):
         read_retry_interval: int = 5,
         write_retry_interval: int = 5,
         compress_cache: bool = False,
+        max_pool_connections: int = 128,
     ):
         self.id = id
         self.accelerator = accelerator
@@ -68,11 +70,8 @@ class S3DataBackend(BaseDataBackend):
         self.write_retry_limit = write_retry_limit
         self.write_retry_interval = write_retry_interval
         self.compress_cache = compress_cache
+        self.max_pool_connections = max_pool_connections
         self.type = "aws"
-        if compress_cache:
-            logging.warning(
-                "Torch cache compression is untested for AWS backends. Open an issue report at https://github.com/bghira/simpletuner/issues/new if you encounter any problems."
-            )
         # AWS buckets might use a region.
         extra_args = {
             "region_name": region_name,
@@ -82,7 +81,7 @@ class S3DataBackend(BaseDataBackend):
             extra_args = {
                 "endpoint_url": endpoint_url,
             }
-        s3_config = Config(max_pool_connections=100)
+        s3_config = Config(max_pool_connections=self.max_pool_connections)
         self.client = boto3.client(
             "s3",
             aws_access_key_id=aws_access_key_id,
@@ -194,7 +193,7 @@ class S3DataBackend(BaseDataBackend):
             for item in response.get("Contents", [])
         ]
 
-    def list_files(self, str_pattern: str, instance_data_root: str = None):
+    def list_files(self, str_pattern: str, instance_data_dir: str = None):
         # Initialize the results list
         results = []
 
@@ -205,8 +204,8 @@ class S3DataBackend(BaseDataBackend):
         paginator = self.client.get_paginator("list_objects_v2")
 
         # We'll use fnmatch to filter based on the provided pattern.
-        if instance_data_root:
-            pattern = os.path.join(instance_data_root or None, str_pattern)
+        if instance_data_dir:
+            pattern = os.path.join(instance_data_dir or None, str_pattern)
         else:
             pattern = str_pattern
 
@@ -214,7 +213,7 @@ class S3DataBackend(BaseDataBackend):
         prefix_dict = {}
         # Log the first few items, alphabetically sorted:
         logger.debug(
-            f"Listing files in S3 bucket {self.bucket_name} in prefix {instance_data_root} with search pattern: {pattern}"
+            f"Listing files in S3 bucket {self.bucket_name} in prefix {instance_data_dir} with search pattern: {pattern}"
         )
 
         # Paginating over the entire bucket objects

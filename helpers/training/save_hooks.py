@@ -27,6 +27,7 @@ try:
         StableDiffusion3Pipeline,
         SD3Transformer2DModel,
         StableDiffusionPipeline,
+        FluxPipeline,
     )
 except ImportError:
     logger.error("This release requires the latest version of Diffusers.")
@@ -44,15 +45,6 @@ try:
 except Exception as e:
     logger.error(
         f"Can not load Hunyuan DiT model class. This release requires the latest version of Diffusers: {e}"
-    )
-    raise e
-
-try:
-    from diffusers.models import AuraFlowTransformer2DModel
-    from diffusers.pipelines import AuraFlowPipeline
-except Exception as e:
-    logger.error(
-        f"Can not load AuraFlowTransformer2DModel class. This release requires the latest version of Diffusers: {e}"
     )
     raise e
 
@@ -130,8 +122,6 @@ class SaveHookManager:
                 self.ema_model_cls = SD3Transformer2DModel
             elif self.args.pixart_sigma:
                 self.ema_model_cls = PixArtTransformer2DModel
-            elif self.args.aura_flow:
-                self.ema_model_cls = AuraFlowTransformer2DModel
             elif self.args.hunyuan_dit:
                 self.ema_model_cls = HunyuanDiT2DModel
 
@@ -184,7 +174,13 @@ class SaveHookManager:
             if weights:
                 weights.pop()
 
-        if self.args.sd3:
+        if self.args.flux:
+            FluxPipeline.save_lora_weights(
+                output_dir,
+                transformer_lora_layers=transformer_lora_layers_to_save,
+                text_encoder_lora_layers=text_encoder_1_lora_layers_to_save,
+            )
+        elif self.args.sd3:
             StableDiffusion3Pipeline.save_lora_weights(
                 output_dir,
                 transformer_lora_layers=transformer_lora_layers_to_save,
@@ -199,12 +195,6 @@ class SaveHookManager:
                 unet_lora_layers=unet_lora_layers_to_save,
                 text_encoder_lora_layers=text_encoder_1_lora_layers_to_save,
                 transformer_lora_layers=transformer_lora_layers_to_save,
-            )
-        elif self.args.aura_flow:
-            AuraFlowPipeline.save_lora_weights(
-                output_dir,
-                transformer_lora_layers=transformer_lora_layers_to_save,
-                text_encoder_lora_layers=text_encoder_1_lora_layers_to_save,
             )
         else:
             StableDiffusionXLPipeline.save_lora_weights(
@@ -295,22 +285,11 @@ class SaveHookManager:
             else:
                 raise ValueError(f"unexpected save model: {model.__class__}")
 
-        if self.args.sd3:
-            lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(input_dir)
-            transformer_state_dict = {
-                f'{k.replace("transformer.", "")}': v
-                for k, v in lora_state_dict.items()
-                if k.startswith("unet.")
-            }
-            transformer_state_dict = convert_unet_state_dict_to_peft(
-                transformer_state_dict
-            )
-            incompatible_keys = set_peft_model_state_dict(
-                transformer_, transformer_state_dict, adapter_name="default"
-            )
-
-        elif self.args.aura_flow:
-            lora_state_dict = AuraFlowPipeline.lora_state_dict(input_dir)
+        if self.args.sd3 or self.args.flux:
+            if self.args.sd3:
+                lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(input_dir)
+            elif self.args.flux:
+                lora_state_dict = FluxPipeline.lora_state_dict(input_dir)
             transformer_state_dict = {
                 f'{k.replace("transformer.", "")}': v
                 for k, v in lora_state_dict.items()
@@ -418,8 +397,10 @@ class SaveHookManager:
                         load_model = HunyuanDiT2DModel.from_pretrained(
                             input_dir, subfolder="transformer"
                         )
-                    elif self.args.aura_flow:
-                        load_model = AuraFlowTransformer2DModel.from_pretrained(
+                    elif self.args.smoldit:
+                        from helpers.models.smoldit import SmolDiT2DModel
+
+                        load_model = SmolDiT2DModel.from_pretrained(
                             input_dir, subfolder="transformer"
                         )
                     elif self.unet is not None:

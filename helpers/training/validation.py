@@ -246,7 +246,7 @@ def prepare_validation_prompt_list(args, embed_cache):
                 validation_negative_prompt_embeds,
                 None,
             )
-        elif model_type == "pixart_sigma" or model_type == "aura_flow":
+        elif model_type == "pixart_sigma" or model_type == "smoldit":
             # we use the legacy encoder but we return no pooled embeds.
             validation_negative_prompt_embeds = (
                 embed_cache.compute_embeddings_for_prompts(
@@ -260,6 +260,22 @@ def prepare_validation_prompt_list(args, embed_cache):
                 validation_shortnames,
                 validation_negative_prompt_embeds,
                 None,
+            )
+        elif model_type == "flux":
+            (
+                validation_negative_prompt_embeds,
+                validation_negative_pooled_embeds,
+                validation_negative_time_ids,
+            ) = embed_cache.compute_embeddings_for_prompts(
+                [StateTracker.get_args().validation_negative_prompt],
+                load_from_cache=False,
+            )
+            return (
+                validation_prompts,
+                validation_shortnames,
+                validation_negative_prompt_embeds,
+                validation_negative_pooled_embeds,
+                validation_negative_time_ids,
             )
         else:
             raise ValueError(f"Unknown model type '{model_type}'")
@@ -425,8 +441,8 @@ class Validation:
         self.text_encoder_3 = text_encoder_3
         self.tokenizer_3 = tokenizer_3
         self.flow_matching = (
-            self.args.sd3 or self.args.aura_flow
-        ) and self.args.flow_matching_loss != "diffusion"
+            self.args.sd3 and self.args.flow_matching_loss != "diffusion"
+        ) or self.args.flux
 
         self._update_state()
 
@@ -508,6 +524,16 @@ class Validation:
             if self.args.validation_using_datasets:
                 return StableDiffusionXLImg2ImgPipeline
             return StableDiffusionXLPipeline
+        elif model_type == "flux":
+            from helpers.models.flux import FluxPipeline
+
+            if self.args.controlnet:
+                raise NotImplementedError("Flux ControlNet is not yet supported.")
+            if self.args.validation_using_datasets:
+                raise NotImplementedError(
+                    "Flux inference validation using img2img is not yet supported. Please remove --validation_using_datasets."
+                )
+            return FluxPipeline
         elif model_type == "kolors":
             if self.args.controlnet:
                 raise NotImplementedError("Kolors ControlNet is not yet supported.")
@@ -550,23 +576,14 @@ class Validation:
             from helpers.pixart.pipeline import PixArtSigmaPipeline
 
             return PixArtSigmaPipeline
-        elif model_type == "aura_flow":
-            if self.args.controlnet:
-                raise Exception(
-                    "AuraFlow ControlNet inference validation is not yet supported."
-                )
-            if self.args.validation_using_datasets:
-                raise Exception(
-                    "AuraFlow inference validation using img2img is not yet supported. Please remove --validation_using_datasets."
-                )
-            try:
-                from helpers.aura_flow.pipeline import AuraFlowPipeline
-            except Exception:
-                logger.error(
-                    "Could not import AuraFlow pipeline. Perhaps you need a git-source version of Diffusers."
-                )
+        elif model_type == "smoldit":
+            from helpers.models.smoldit import SmolDiTPipeline
 
-            return AuraFlowPipeline
+            return SmolDiTPipeline
+        else:
+            raise NotImplementedError(
+                f"Model type {model_type} not implemented for validation."
+            )
 
     def _gather_prompt_embeds(self, validation_prompt: str):
         prompt_embeds = {}
@@ -575,14 +592,31 @@ class Validation:
             StateTracker.get_model_type() == "sdxl"
             or StateTracker.get_model_type() == "sd3"
             or StateTracker.get_model_type() == "kolors"
+            or StateTracker.get_model_type() == "flux"
         ):
-            (
-                current_validation_prompt_embeds,
-                current_validation_pooled_embeds,
-            ) = self.embed_cache.compute_embeddings_for_prompts([validation_prompt])
+            _embed = self.embed_cache.compute_embeddings_for_prompts(
+                [validation_prompt]
+            )
+            current_validation_time_ids = None
+            if len(_embed) == 2:
+                (
+                    current_validation_prompt_embeds,
+                    current_validation_pooled_embeds,
+                ) = _embed
+            elif len(_embed) == 3:
+                (
+                    current_validation_prompt_embeds,
+                    current_validation_pooled_embeds,
+                    current_validation_time_ids,
+                ) = _embed
+            else:
+                raise ValueError(
+                    f"Unexpected number of embeddings returned from cache: {_embed}"
+                )
             if (
                 self.prompt_handler is not None
                 and not StateTracker.get_model_type() == "sd3"
+                and not StateTracker.get_model_type() == "flux"
             ):
                 for text_encoder in self.prompt_handler.text_encoders:
                     # Can't remember why we move this to the GPU right here..
@@ -606,6 +640,10 @@ class Validation:
             current_validation_pooled_embeds = current_validation_pooled_embeds.to(
                 device=self.accelerator.device, dtype=self.weight_dtype
             )
+            if current_validation_time_ids is not None:
+                current_validation_time_ids = current_validation_time_ids.to(
+                    device=self.accelerator.device, dtype=self.weight_dtype
+                )
             self.validation_negative_pooled_embeds = (
                 self.validation_negative_pooled_embeds.to(
                     device=self.accelerator.device, dtype=self.weight_dtype
@@ -615,17 +653,19 @@ class Validation:
             prompt_embeds["negative_pooled_prompt_embeds"] = (
                 self.validation_negative_pooled_embeds
             )
+            # if current_validation_time_ids is not None:
+            #     prompt_embeds["time_ids"] = current_validation_time_ids
         elif (
             StateTracker.get_model_type() == "legacy"
             or StateTracker.get_model_type() == "pixart_sigma"
-            or StateTracker.get_model_type() == "aura_flow"
+            or StateTracker.get_model_type() == "smoldit"
         ):
             self.validation_negative_pooled_embeds = None
             current_validation_pooled_embeds = None
             current_validation_prompt_embeds = (
                 self.embed_cache.compute_embeddings_for_prompts([validation_prompt])
             )
-            if self.args.pixart_sigma or self.args.aura_flow:
+            if any([self.args.pixart_sigma, self.args.smoldit]):
                 current_validation_prompt_embeds, current_validation_prompt_mask = (
                     current_validation_prompt_embeds
                 )
@@ -649,9 +689,8 @@ class Validation:
             # )
             if (
                 self.prompt_handler is not None
-                and not self.deepfloyd
-                and not self.args.pixart_sigma
-                and not self.flow_matching
+                and StateTracker.get_model_type() in ["sdxl", "legacy"]
+                and "deepfloyd" not in StateTracker.get_args().model_type
             ):
                 # for SDXL and earlier SD models we optionally use Compel for prompt upweighting/long prompt parsing.
                 for text_encoder in self.prompt_handler.text_encoders:
@@ -702,7 +741,7 @@ class Validation:
         prompt_embeds["negative_prompt_embeds"] = self.validation_negative_prompt_embeds
         if (
             StateTracker.get_model_type() == "pixart_sigma"
-            or StateTracker.get_model_type() == "aura_flow"
+            or StateTracker.get_model_type() == "smoldit"
         ):
             prompt_embeds["prompt_mask"] = current_validation_prompt_mask
             prompt_embeds["negative_mask"] = self.validation_negative_prompt_mask
@@ -844,10 +883,18 @@ class Validation:
 
     def setup_scheduler(self):
         if self.args.validation_noise_scheduler is None:
+            print("no scheduler")
+            return
+        if self.flow_matching:
+            # NO TOUCHIE FOR FLOW-MATCHING.
+            # Touchie for diffusion though.
             return
 
         scheduler_args = {}
-        if "variance_type" in self.pipeline.scheduler.config:
+        if (
+            self.pipeline is not None
+            and "variance_type" in self.pipeline.scheduler.config
+        ):
             variance_type = self.pipeline.scheduler.config.variance_type
 
             if variance_type in ["learned", "learned_range"]:
@@ -856,12 +903,7 @@ class Validation:
             scheduler_args["variance_type"] = variance_type
         if self.deepfloyd:
             self.args.validation_noise_scheduler = "ddpm"
-        if self.flow_matching:
-            # NO TOUCHIE FOR FLOW-MATCHING.
-            # Touchie for diffusion though.
-            return
-
-        self.pipeline.scheduler = SCHEDULER_NAME_MAP[
+        scheduler = SCHEDULER_NAME_MAP[
             self.args.validation_noise_scheduler
         ].from_pretrained(
             self.args.pretrained_model_name_or_path,
@@ -872,6 +914,9 @@ class Validation:
             rescale_betas_zero_snr=self.args.rescale_betas_zero_snr,
             **scheduler_args,
         )
+        if self.pipeline is not None:
+            self.pipeline.scheduler = scheduler
+        return scheduler
 
     def setup_pipeline(self, validation_type, enable_ema_model: bool = True):
         if validation_type == "intermediary" and self.args.use_ema:
@@ -919,9 +964,13 @@ class Validation:
                     extra_pipeline_kwargs["text_encoder_2"] = None
                     extra_pipeline_kwargs["tokenizer_2"] = None
 
-            if self.args.aura_flow:
-                extra_pipeline_kwargs["tokenizer"] = None
-                extra_pipeline_kwargs["text_encoder"] = None
+            if self.args.smoldit:
+                extra_pipeline_kwargs["transformer"] = unwrap_model(
+                    self.accelerator, self.transformer
+                )
+                extra_pipeline_kwargs["tokenizer"] = self.tokenizer_1
+                extra_pipeline_kwargs["text_encoder"] = self.text_encoder_1
+                extra_pipeline_kwargs["scheduler"] = self.setup_scheduler()
 
             if self.args.controlnet:
                 # ControlNet training has an additional adapter thingy.
@@ -970,9 +1019,23 @@ class Validation:
             while attempt < 3:
                 attempt += 1
                 try:
-                    self.pipeline = pipeline_cls.from_pretrained(**pipeline_kwargs)
+                    if self.args.smoldit:
+                        self.pipeline = pipeline_cls(
+                            vae=self.vae,
+                            transformer=unwrap_model(
+                                self.accelerator, self.transformer
+                            ),
+                            tokenizer=self.tokenizer_1,
+                            text_encoder=self.text_encoder_1,
+                            scheduler=self.setup_scheduler(),
+                        )
+                    else:
+                        self.pipeline = pipeline_cls.from_pretrained(**pipeline_kwargs)
                 except Exception as e:
+                    import traceback
+
                     logger.error(e)
+                    logger.error(traceback.format_exc())
                     continue
                 return None
             if self.args.validation_torch_compile:
@@ -1098,6 +1161,7 @@ class Validation:
                     self.args.pixart_sigma,
                     self.flow_matching,
                     self.args.kolors,
+                    self.args.flux,
                 ]
             ):
                 extra_validation_kwargs["guidance_rescale"] = (
@@ -1152,9 +1216,16 @@ class Validation:
                 for key, value in self.pipeline.components.items():
                     if hasattr(value, "device"):
                         logger.debug(f"Device for {key}: {value.device}")
+                if StateTracker.get_model_type() == "flux":
+                    if "negative_prompt" in pipeline_kwargs:
+                        del pipeline_kwargs["negative_prompt"]
+                    if "negative_prompt_embeds" in pipeline_kwargs:
+                        del pipeline_kwargs["negative_prompt_embeds"]
+                    if "negative_pooled_prompt_embeds" in pipeline_kwargs:
+                        del pipeline_kwargs["negative_pooled_prompt_embeds"]
                 if (
                     StateTracker.get_model_type() == "pixart_sigma"
-                    or StateTracker.get_model_type() == "aura_flow"
+                    or StateTracker.get_model_type() == "smoldit"
                 ):
                     if pipeline_kwargs.get("negative_prompt") is not None:
                         del pipeline_kwargs["negative_prompt"]
@@ -1257,7 +1328,8 @@ class Validation:
                 logger.debug(
                     "Skipping EMA model restoration for validation, as enable_ema_model=False."
                 )
-        if not self.args.keep_vae_loaded and self.args.vae_cache_preprocess:
+        if not self.args.keep_vae_loaded and not self.args.vae_cache_ondemand:
+            self.vae = self.vae.to("cpu")
             self.vae = None
         self.pipeline = None
         if torch.cuda.is_available():
